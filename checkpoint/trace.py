@@ -454,7 +454,13 @@ class TraceGenerator:
     integrating with the checkpoint system's IO operations.
     """
 
-    def __init__(self, checkpoint_name: str, checkpoint_type: str, root_dir: str):
+    def __init__(
+        self,
+        checkpoint_name: str,
+        checkpoint_type: str,
+        source_dir: str,
+        dest_dir: Optional[str] = None
+    ):
         """Initialize the TraceGenerator.
 
         Parameters
@@ -463,12 +469,18 @@ class TraceGenerator:
             Name of the current checkpoint.
         checkpoint_type: str
             Type of checkpoint ('human' or 'ai').
-        root_dir: str
-            Root directory of the project.
+        source_dir: str
+            Source directory of the project (for reference).
+        dest_dir: str, optional
+            Destination directory for checkpoint storage.
+            Defaults to source_dir if not provided.
         """
         self.checkpoint_name = checkpoint_name
         self.checkpoint_type = checkpoint_type
-        self.root_dir = root_dir
+        self.source_dir = source_dir
+        self.dest_dir = dest_dir or source_dir
+        # Keep root_dir as an alias for source_dir for backward compatibility
+        self.root_dir = self.source_dir
 
     def get_previous_checkpoint_name(self) -> Optional[str]:
         """Get the name of the previous checkpoint.
@@ -478,7 +490,8 @@ class TraceGenerator:
         Optional[str]
             Name of the previous checkpoint, or None if this is the first.
         """
-        config_path = os.path.join(self.root_dir, '.checkpoint', '.config')
+        # Read config from destination directory
+        config_path = os.path.join(self.dest_dir, '.checkpoint', '.config')
         if not os.path.exists(config_path):
             return None
 
@@ -531,5 +544,6 @@ class TraceGenerator:
             previous_checkpoint_name=previous_checkpoint_name
         )
 
-        checkpoint_dir = os.path.join(self.root_dir, '.checkpoint', self.checkpoint_name)
+        # Save trace to destination directory
+        checkpoint_dir = os.path.join(self.dest_dir, '.checkpoint', self.checkpoint_name)
         return save_trace(trace_data, checkpoint_dir)

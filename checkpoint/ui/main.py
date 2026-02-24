@@ -24,7 +24,36 @@ except ImportError:
 
 @eel.expose
 def run_cli_sequence(args=None):
-    args = args[0:2] + ['-i'] + args[3].split(" ") + args[4:]
+    """Run the CLI sequence with the provided arguments.
+
+    Parameters
+    ----------
+    args: list, optional
+        List of arguments for the CLI sequence.
+        Expected format: [name, action, '-i', ignore_dirs_str, source, destination]
+        where:
+        - name: Name of the checkpoint
+        - action: Action to perform (create, restore, delete, init)
+        - ignore_dirs_str: Space-separated string of directories to ignore
+        - source: Source directory to track/monitor
+        - destination: Destination directory for .checkpoint storage
+
+    Returns
+    -------
+    bool
+        True if the sequence executed successfully, False otherwise.
+    """
+    # Reconstruct args with proper structure
+    # args format: [name, action, '-i', ignore_dirs_str, source, destination]
+    if len(args) >= 6:
+        # New format with source and destination
+        args = args[0:2] + ['-i'] + args[3].split(" ") + ['--source', args[4], '--destination', args[5]]
+    elif len(args) >= 5:
+        # Format with source only (destination defaults to source)
+        args = args[0:2] + ['-i'] + args[3].split(" ") + ['--source', args[4]]
+    else:
+        # Legacy format for backward compatibility
+        args = args[0:2] + ['-i'] + args[3].split(" ") if len(args) > 3 else args
 
     status = False
     checkpoint_arg_parser = ArgumentParser(
@@ -40,10 +69,25 @@ def run_cli_sequence(args=None):
     )
 
     checkpoint_arg_parser.add_argument(
+        "-s",
+        "--source",
+        type=str,
+        help="Source directory to track/monitor for changes.",
+    )
+
+    checkpoint_arg_parser.add_argument(
+        "-d",
+        "--destination",
+        type=str,
+        help="Destination directory where .checkpoint folder will be created. "
+             "Defaults to source directory if not provided.",
+    )
+
+    checkpoint_arg_parser.add_argument(
         "-p",
         "--path",
         type=str,
-        help="Path to the project.",
+        help="[DEPRECATED] Use --source instead. Path to the project.",
     )
 
     checkpoint_arg_parser.add_argument(
@@ -91,20 +135,20 @@ def read_logs():
 
 
 @eel.expose
-def get_all_checkpoints(target_dir):
-    """Get all checkpoints present inside athe target directory.
+def get_all_checkpoints(dest_dir):
+    """Get all checkpoints present inside the destination directory.
 
     Parameters
     ----------
-    target_dir: str
-        Path to the directory
+    dest_dir: str
+        Path to the destination directory (where .checkpoint folder exists).
 
     Returns
     -------
     list of str
-        List containing names of all checkpoints
+        List containing names of all checkpoints.
     """
-    checkpoint_path = os.path.join(target_dir, '.checkpoint')
+    checkpoint_path = os.path.join(dest_dir, '.checkpoint')
 
     if not os.path.isdir(checkpoint_path):
         return []
@@ -121,8 +165,20 @@ def get_all_checkpoints(target_dir):
 
 
 @eel.expose
-def get_ignore_dirs(target_dir):
-    checkpoint_path = os.path.join(target_dir, '.checkpoint')
+def get_ignore_dirs(dest_dir):
+    """Get ignore directories from the checkpoint config.
+
+    Parameters
+    ----------
+    dest_dir: str
+        Path to the destination directory (where .checkpoint folder exists).
+
+    Returns
+    -------
+    list of str
+        List of directory names to ignore.
+    """
+    checkpoint_path = os.path.join(dest_dir, '.checkpoint')
 
     config_path = os.path.join(checkpoint_path, '.config')
     if not os.path.isfile(config_path):
@@ -135,8 +191,20 @@ def get_ignore_dirs(target_dir):
 
 
 @eel.expose
-def get_current_checkpoint(target_dir):
-    checkpoint_path = os.path.join(target_dir, '.checkpoint')
+def get_current_checkpoint(dest_dir):
+    """Get the current checkpoint from the destination directory.
+
+    Parameters
+    ----------
+    dest_dir: str
+        Path to the destination directory (where .checkpoint folder exists).
+
+    Returns
+    -------
+    str or None
+        Name of the current checkpoint, or None if not set.
+    """
+    checkpoint_path = os.path.join(dest_dir, '.checkpoint')
 
     config_path = os.path.join(checkpoint_path, '.config')
     if not os.path.isfile(config_path):
@@ -150,15 +218,46 @@ def get_current_checkpoint(target_dir):
 
 
 @eel.expose
-def generate_tree(checkpoint_name, target_directory):
+def get_source_dir(dest_dir):
+    """Get the source directory from the checkpoint config.
+
+    Parameters
+    ----------
+    dest_dir: str
+        Path to the destination directory (where .checkpoint folder exists).
+
+    Returns
+    -------
+    str or None
+        The source directory path stored in config, or None if not found.
+    """
+    config_path = os.path.join(dest_dir, '.checkpoint', '.config')
+    if not os.path.isfile(config_path):
+        return None
+
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+        # Handle both new format (source_dir) and old format (root_dir)
+        source_dir = config.get('source_dir') or config.get('root_dir')
+
+    return source_dir
+
+
+@eel.expose
+def generate_tree(checkpoint_name, dest_dir):
     """Generate a Tree from the metadata of a certain checkpoint.
 
     Parameters
     ----------
     checkpoint_name: str
         Name of the checkpoint.
-    target_directory: str
-        Path to the target directory.
+    dest_dir: str
+        Path to the destination directory (where .checkpoint folder exists).
+
+    Returns
+    -------
+    dict
+        Serializable tree structure with folder names, subfolders, and files.
     """
     class Tree:
         def __init__(self, name, folders=None, files=None, parent=None):
@@ -174,9 +273,9 @@ def generate_tree(checkpoint_name, target_directory):
     tree_dict = {}
     curr_folder_idx = 0
 
-    io = IO(target_directory)
+    io = IO(dest_dir)
     checkpoint_path = os.path.join(
-        target_directory, '.checkpoint', checkpoint_name)
+        dest_dir, '.checkpoint', checkpoint_name)
     metadata = io.read(os.path.join(checkpoint_path, '.metadata'))
     metadata = json.loads(metadata)
 
