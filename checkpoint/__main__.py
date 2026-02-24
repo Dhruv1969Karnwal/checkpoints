@@ -54,6 +54,16 @@ def run(args=None):
                  ".venv", "node_modules", "__pycache__" , "venv"],
         help="Ignore directories."
     )
+
+    checkpoint_arg_parser.add_argument(
+        "--type",
+        "-t",
+        type=str,
+        help="Type of checkpoint: human or ai",
+        choices=["human", "ai"],
+        default=None
+    )
+
     if args is not None:
         run_ui = args.run_ui
     else:

@@ -14,6 +14,7 @@ from checkpoint import __version__ as version
 from checkpoint.crypt import Crypt, generate_key
 from checkpoint.io import IO
 from checkpoint.readers import get_all_readers
+from checkpoint.trace import TraceGenerator
 from checkpoint.utils import LogColors, get_reader_by_extension, Logger
 
 _logger = Logger()
@@ -471,7 +472,7 @@ class CheckpointSequence(Sequence):
     """Sequence to perform checkpoint operations."""
 
     def __init__(self, sequence_name, order_dict, root_dir, ignore_dirs,
-                 terminal_log=False, env='UI'):
+                 terminal_log=False, env='UI', checkpoint_type=None):
         """Initialize the CheckpointSequence class.
 
         Parameters
@@ -486,11 +487,14 @@ class CheckpointSequence(Sequence):
             List of directories to be ignored.
         terminal_log: bool, optional
             If True, messages will be logged to the terminal
+        checkpoint_type: str, optional
+            Type of checkpoint ('human' or 'ai'). If provided, generates trace.json.
         """
         self.sequence_name = sequence_name
         self.order_dict = order_dict
         self.root_dir = root_dir
         self.ignore_dirs = ignore_dirs
+        self.checkpoint_type = checkpoint_type
         super(CheckpointSequence, self).__init__(sequence_name, order_dict,
                                                  terminal_log=terminal_log, env=env)
 
@@ -562,6 +566,66 @@ class CheckpointSequence(Sequence):
 
         with open(os.path.join(checkpoint_path, '.metadata'), 'w+') as metadata_file:
             json.dump(root2file, metadata_file, indent=4)
+
+        # Generate trace.json if checkpoint_type is provided
+        if self.checkpoint_type:
+            self._generate_trace(enc_files, checkpoint_path)
+
+    def _generate_trace(self, enc_files, checkpoint_path):
+        """Generate trace.json for the checkpoint.
+
+        Parameters
+        ----------
+        enc_files: dict
+            Dictionary of encrypted file paths and their content.
+        checkpoint_path: str
+            Path to the checkpoint directory.
+        """
+        # Decrypt current files for trace generation
+        _key = os.path.join(self.root_dir, '.checkpoint')
+        crypt = Crypt(key='crypt.key', key_path=_key)
+
+        current_files = {}
+        for file_path, encrypted_content in enc_files.items():
+            content = crypt.decrypt(encrypted_content)
+            current_files[file_path] = content
+
+        # Get previous checkpoint files if available
+        previous_files = None
+        previous_checkpoint_name = None
+
+        config_path = os.path.join(self.root_dir, '.checkpoint', '.config')
+        with open(config_path, 'r') as config_file:
+            config = json.load(config_file)
+
+        checkpoints = config.get('checkpoints', [])
+        # Get the checkpoint before the current one (current is already added)
+        if len(checkpoints) > 1:
+            previous_checkpoint_name = checkpoints[-2]
+            previous_checkpoint_path = os.path.join(
+                self.root_dir, '.checkpoint', previous_checkpoint_name,
+                f'{previous_checkpoint_name}.json')
+
+            if os.path.exists(previous_checkpoint_path):
+                with open(previous_checkpoint_path, 'r') as prev_file:
+                    prev_enc_files = json.load(prev_file)
+
+                previous_files = {}
+                for file_path, encrypted_content in prev_enc_files.items():
+                    content = crypt.decrypt(encrypted_content)
+                    previous_files[file_path] = content
+
+        # Generate and save trace
+        trace_generator = TraceGenerator(
+            checkpoint_name=self.sequence_name,
+            checkpoint_type=self.checkpoint_type,
+            root_dir=self.root_dir
+        )
+        trace_generator.generate_and_save(
+            current_files=current_files,
+            previous_files=previous_files,
+            previous_checkpoint_name=previous_checkpoint_name
+        )
 
     def seq_delete_checkpoint(self):
         """Delete the checkpoint for the target directory."""
@@ -695,6 +759,7 @@ class CLISequence(Sequence):
         _name = args.name
         _path = args.path
         _ignore_dirs = args.ignore_dirs or []
+        _checkpoint_type = getattr(args, 'type', None)
         _helper_actions = ['seq_init_checkpoint', 'seq_version']
 
         if not (_name and _path) and action not in _helper_actions:
@@ -703,6 +768,7 @@ class CLISequence(Sequence):
         order_dict = {action: 0}
         _checkpoint_sequence = CheckpointSequence(
             _name, order_dict, _path, _ignore_dirs,
-            terminal_log=self.terminal_log, env=self.env)
+            terminal_log=self.terminal_log, env=self.env,
+            checkpoint_type=_checkpoint_type)
         action_function = getattr(_checkpoint_sequence, action)
         action_function()

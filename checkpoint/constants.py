@@ -16,3 +16,9 @@ FILE_READER2EXTENSIONS = {
         'ipa', 'deb', 'rpm', 'cab', 'pkg', 'mpkg', 'msi', 'msp',
         'mst', 'msu', 'msp', 'mse', 'makefile', '']
 }
+
+#: Filename for the trace file generated in checkpoint directories
+TRACE_FILENAME = 'trace.json'
+
+#: File extensions that are considered text files for line-level diff
+TEXT_EXTENSIONS = set(FILE_READER2EXTENSIONS["TEXT_READER"])
