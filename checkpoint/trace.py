@@ -147,7 +147,7 @@ def is_text_file(file_path: str) -> bool:
 
 
 def is_binary_content(content: bytes) -> bool:
-    """Check if content appears to be binary.
+    """Check if content appears to be binary (not text).
 
     Parameters
     ----------
@@ -157,12 +157,45 @@ def is_binary_content(content: bytes) -> bool:
     Returns
     -------
     bool
-        True if the content appears to be binary.
+        True if the content appears to be binary (not decodable as text).
     """
-    # Check for null bytes which typically indicate binary content
-    if b'\x00' in content:
-        return True
-    return False
+    # Try common text encodings
+    encodings_to_try = ['utf-8', 'utf-16', 'utf-16-le', 'utf-16-be', 'latin-1']
+    
+    for encoding in encodings_to_try:
+        try:
+            content.decode(encoding)
+            return False  # Successfully decoded, not binary
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    
+    return True  # Could not decode with any encoding, likely binary
+
+
+def decode_text_content(content: bytes) -> Optional[Tuple[str, str]]:
+    """Try to decode text content using various encodings.
+
+    Parameters
+    ----------
+    content: bytes
+        The file content.
+
+    Returns
+    -------
+    Optional[Tuple[str, str]]
+        Tuple of (decoded_text, encoding_used) if successful, None otherwise.
+    """
+    # Try common text encodings in order of preference
+    encodings_to_try = ['utf-8', 'utf-16', 'utf-16-le', 'utf-16-be', 'latin-1']
+    
+    for encoding in encodings_to_try:
+        try:
+            decoded = content.decode(encoding)
+            return (decoded, encoding)
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    
+    return None
 
 
 def generate_trace(
@@ -274,16 +307,16 @@ def _process_file(
         }
 
         if not is_binary:
-            try:
-                lines = content.decode('utf-8').splitlines(keepends=True)
+            decoded = decode_text_content(content)
+            if decoded:
+                lines = decoded[0].splitlines(keepends=True)
                 file_info['stats']['lines_added'] = len(lines)
                 file_info['line_changes'] = [{
                     'start_line': 1,
                     'end_line': len(lines),
                     'change_type': 'added'
                 }]
-            except UnicodeDecodeError:
-                # Treat as binary if we can't decode
+            else:
                 file_info['is_binary'] = True
 
         return file_info
@@ -299,15 +332,16 @@ def _process_file(
         }
 
         if not is_binary:
-            try:
-                lines = content.decode('utf-8').splitlines(keepends=True)
+            decoded = decode_text_content(content)
+            if decoded:
+                lines = decoded[0].splitlines(keepends=True)
                 file_info['stats']['lines_added'] = len(lines)
                 file_info['line_changes'] = [{
                     'start_line': 1,
                     'end_line': len(lines),
                     'change_type': 'added'
                 }]
-            except UnicodeDecodeError:
+            else:
                 file_info['is_binary'] = True
 
         return file_info
@@ -335,13 +369,16 @@ def _process_file(
 
     # Compute line diff for text files
     if not is_binary:
-        try:
-            old_lines = previous_content.decode('utf-8').splitlines(keepends=True)
-            new_lines = content.decode('utf-8').splitlines(keepends=True)
+        decoded_old = decode_text_content(previous_content)
+        decoded_new = decode_text_content(content)
+        
+        if decoded_old and decoded_new:
+            old_lines = decoded_old[0].splitlines(keepends=True)
+            new_lines = decoded_new[0].splitlines(keepends=True)
 
             file_info['line_changes'] = compute_line_diff(old_lines, new_lines)
             file_info['stats'] = compute_line_stats(old_lines, new_lines)
-        except UnicodeDecodeError:
+        else:
             file_info['is_binary'] = True
 
     return file_info
@@ -373,8 +410,9 @@ def _process_deleted_file(file_path: str, content: bytes) -> Dict[str, Any]:
     }
 
     if not is_binary:
-        try:
-            lines = content.decode('utf-8').splitlines(keepends=True)
+        decoded = decode_text_content(content)
+        if decoded:
+            lines = decoded[0].splitlines(keepends=True)
             file_info['stats']['lines_deleted'] = len(lines)
             file_info['line_changes'] = [{
                 'start_line': 1,
@@ -382,7 +420,7 @@ def _process_deleted_file(file_path: str, content: bytes) -> Dict[str, Any]:
                 'change_type': 'deleted',
                 'old_range': [1, len(lines)]
             }]
-        except UnicodeDecodeError:
+        else:
             file_info['is_binary'] = True
 
     return file_info
