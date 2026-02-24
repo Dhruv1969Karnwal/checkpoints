@@ -1,0 +1,6 @@
+numpy==1.23.2
+pillow
+pyfiglet==0.8.post1
+joblib
+cryptography
+rich
