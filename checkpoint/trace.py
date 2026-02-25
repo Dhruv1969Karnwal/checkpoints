@@ -31,6 +31,67 @@ def compute_file_hash(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
+def get_file_metadata(file_path: str) -> dict:
+    """Get file metadata using os.stat().
+
+    Parameters
+    ----------
+    file_path: str
+        Path to the file.
+
+    Returns
+    -------
+    dict
+        Dictionary with 'size' and 'mtime' keys.
+    """
+    stat_info = os.stat(file_path)
+    return {
+        'size': stat_info.st_size,
+        'mtime': stat_info.st_mtime
+    }
+
+
+def is_legacy_checkpoint(checkpoint_data: dict) -> bool:
+    """Check if checkpoint uses legacy format (direct path→content mapping).
+
+    Parameters
+    ----------
+    checkpoint_data: dict
+        The checkpoint data dictionary.
+
+    Returns
+    -------
+    bool
+        True if legacy format, False if new format.
+    """
+    # Legacy format: keys are paths, values are strings (encrypted content)
+    # New format: has 'version', 'created_at', 'files' keys
+    return 'version' not in checkpoint_data
+
+
+def migrate_checkpoint_format(legacy_data: dict) -> dict:
+    """Migrate legacy checkpoint format to new format.
+
+    Note: Legacy checkpoints don't have metadata, so we can only wrap the content.
+
+    Parameters
+    ----------
+    legacy_data: dict
+        The legacy checkpoint data (direct path→content mapping).
+
+    Returns
+    -------
+    dict
+        The migrated checkpoint data in new format.
+    """
+    return {
+        'version': '3.0.0',
+        'created_at': datetime.now(timezone.utc).isoformat(),
+        'files': legacy_data,  # Keep as-is, metadata will be computed on first use
+        'migrated': True  # Flag to indicate this was migrated
+    }
+
+
 def compute_line_diff(old_lines: List[str], new_lines: List[str]) -> List[Dict[str, Any]]:
     """Compute line-level changes between two file versions.
 
@@ -570,8 +631,12 @@ def has_changes(
 ) -> Tuple[bool, Optional[str]]:
     """Check if there are any changes compared to the latest checkpoint.
 
-    This function performs a lightweight comparison between the current files
-    and the latest checkpoint to determine if any changes exist.
+    This function performs an optimized three-phase comparison between the 
+    current files and the latest checkpoint to determine if any changes exist.
+
+    Phase 1: Quick file set comparison (instant detection of added/deleted files)
+    Phase 2: Metadata comparison using os.stat() (instant, no file reading)
+    Phase 3: Hash comparison ONLY for files where metadata differs
 
     Parameters
     ----------
@@ -595,32 +660,33 @@ def has_changes(
     from checkpoint.crypt import Crypt
     from checkpoint.io import IO
 
+    # === PHASE 0: Initial Checks ===
     # Check if .checkpoint directory exists
     checkpoint_base = os.path.join(dest_dir, '.checkpoint')
-    print(f"[DEBUG] Checking for checkpoint base: {checkpoint_base}")
-    print(f"[DEBUG] Checkpoint base exists: {os.path.exists(checkpoint_base)}")
+    print(f"[DEBUG] Phase 0: Checking for checkpoint base: {checkpoint_base}")
+    print(f"[DEBUG] Phase 0: Checkpoint base exists: {os.path.exists(checkpoint_base)}")
     
     if not os.path.exists(checkpoint_base):
-        print(f"[DEBUG] No checkpoint base found - treating as first checkpoint")
+        print(f"[DEBUG] Phase 0: No checkpoint base found - treating as first checkpoint")
         return True, None  # No checkpoint exists, treat as having changes (first checkpoint)
 
     # Check if config file exists
     config_path = os.path.join(checkpoint_base, '.config')
-    print(f"[DEBUG] Config path: {config_path}")
-    print(f"[DEBUG] Config exists: {os.path.exists(config_path)}")
+    print(f"[DEBUG] Phase 0: Config path: {config_path}")
+    print(f"[DEBUG] Phase 0: Config exists: {os.path.exists(config_path)}")
     
     if not os.path.exists(config_path):
-        print(f"[DEBUG] No config file found - treating as having changes")
+        print(f"[DEBUG] Phase 0: No config file found - treating as having changes")
         return True, None  # No config, treat as having changes
 
     with open(config_path, 'r', encoding='utf-8') as config_file:
         config = json.load(config_file)
 
     checkpoints = config.get('checkpoints', [])
-    print(f"[DEBUG] Checkpoints in config: {checkpoints}")
+    print(f"[DEBUG] Phase 0: Checkpoints in config: {checkpoints}")
     
     if not checkpoints:
-        print(f"[DEBUG] No checkpoints in config - treating as first checkpoint")
+        print(f"[DEBUG] Phase 0: No checkpoints in config - treating as first checkpoint")
         return True, None  # No checkpoints, treat as having changes (first checkpoint)
 
     # Get the latest checkpoint
@@ -628,110 +694,179 @@ def has_changes(
     latest_checkpoint_path = os.path.join(
         checkpoint_base, latest_checkpoint, f'{latest_checkpoint}.json'
     )
-    print(f"[DEBUG] Latest checkpoint: {latest_checkpoint}")
-    print(f"[DEBUG] Latest checkpoint path: {latest_checkpoint_path}")
-    print(f"[DEBUG] Checkpoint file exists: {os.path.exists(latest_checkpoint_path)}")
+    print(f"[DEBUG] Phase 0: Latest checkpoint: {latest_checkpoint}")
+    print(f"[DEBUG] Phase 0: Latest checkpoint path: {latest_checkpoint_path}")
+    print(f"[DEBUG] Phase 0: Checkpoint file exists: {os.path.exists(latest_checkpoint_path)}")
 
     if not os.path.exists(latest_checkpoint_path):
-        print(f"[DEBUG] Checkpoint file missing - treating as having changes")
+        print(f"[DEBUG] Phase 0: Checkpoint file missing - treating as having changes")
         return True, None  # Checkpoint file missing, treat as having changes
 
-    # Load the encryption key and decrypt previous checkpoint files
+    # Load the encryption key
     try:
         crypt = Crypt(key='crypt.key', key_path=checkpoint_base)
-        print(f"[DEBUG] Crypt initialized successfully")
+        print(f"[DEBUG] Phase 0: Crypt initialized successfully")
     except Exception as e:
-        print(f"[DEBUG] Crypt initialization failed: {type(e).__name__}: {e}")
+        print(f"[DEBUG] Phase 0: Crypt initialization failed: {type(e).__name__}: {e}")
         return True, None  # Can't decrypt, treat as having changes
 
-    # Load previous checkpoint files
-    previous_files = {}
+    # Load previous checkpoint data
     try:
         with open(latest_checkpoint_path, 'r', encoding='utf-8') as f:
-            prev_enc_files = json.load(f)
+            prev_checkpoint_data = json.load(f)
 
-        print(f"[DEBUG] Previous checkpoint contains {len(prev_enc_files)} encrypted files")
+        print(f"[DEBUG] Phase 0: Previous checkpoint loaded")
 
-        for file_path, encrypted_content in prev_enc_files.items():
-            try:
-                content = crypt.decrypt(encrypted_content)
-                previous_files[file_path] = content
-            except Exception as e:
-                print(f"[DEBUG] Failed to decrypt file {file_path}: {type(e).__name__}: {e}")
-                return True, latest_checkpoint
-        
-        print(f"[DEBUG] Successfully decrypted {len(previous_files)} previous files")
-        if previous_files:
-            sample_paths = list(previous_files.keys())[:3]
-            print(f"[DEBUG] Sample previous file paths: {sample_paths}")
+        # Handle both legacy and new checkpoint formats
+        if is_legacy_checkpoint(prev_checkpoint_data):
+            # Legacy format: direct path→encrypted_content mapping
+            print(f"[DEBUG] Phase 0: Legacy format detected - migrating")
+            prev_checkpoint_data = migrate_checkpoint_format(prev_checkpoint_data)
+            files_data = prev_checkpoint_data.get('files', {})
+            print(f"[DEBUG] Phase 0: Migrated - {len(files_data)} files")
+            is_new_format = True
+        else:
+            # New format: files are nested under 'files' key
+            files_data = prev_checkpoint_data.get('files', {})
+            print(f"[DEBUG] Phase 0: New format (v{prev_checkpoint_data.get('version', 'unknown')}) - {len(files_data)} files")
+            is_new_format = True
+
     except Exception as e:
-        print(f"[DEBUG] Failed to load previous checkpoint: {type(e).__name__}: {e}")
+        print(f"[DEBUG] Phase 0: Failed to load previous checkpoint: {type(e).__name__}: {e}")
         return True, latest_checkpoint
 
-    # Get current files if not provided
-    if current_files is None:
-        current_files = {}
+    # === PHASE 1: File Set Comparison ===
+    print(f"[DEBUG] Phase 1: Starting file set comparison")
+    
+    # Get current file paths
+    if current_files is not None:
+        current_file_paths = set(current_files.keys())
+        print(f"[DEBUG] Phase 1: Using provided current_files - {len(current_file_paths)} paths")
+    else:
+        # Get file paths by walking the directory (without reading content)
+        current_file_paths = set()
         source_io = IO(path=source_dir, ignore_dirs=ignore_dirs)
         
-        print(f"[DEBUG] Reading current files from: {source_dir}")
-        print(f"[DEBUG] Ignore dirs: {ignore_dirs}")
+        print(f"[DEBUG] Phase 1: Walking directory: {source_dir}")
+        print(f"[DEBUG] Phase 1: Ignore dirs: {ignore_dirs}")
         
         for root, file in source_io.walk_directory():
             file_path = os.path.join(root, file)
-            try:
-                with open(file_path, 'rb') as f:
-                    current_files[file_path] = f.read()
-            except Exception as e:
-                print(f"[DEBUG] Failed to read file {file_path}: {type(e).__name__}: {e}")
-                return True, latest_checkpoint
+            # Filter by reader availability (same as seq_map_readers does)
+            extension = os.path.basename(file_path).split('.')[-1].lower() if '.' in file_path else ''
+            reader = get_reader_by_extension(extension)
+            if reader is not None:
+                current_file_paths.add(file_path)
         
-        print(f"[DEBUG] Read {len(current_files)} current files")
-        if current_files:
-            sample_paths = list(current_files.keys())[:3]
-            print(f"[DEBUG] Sample current file paths: {sample_paths}")
+        print(f"[DEBUG] Phase 1: Found {len(current_file_paths)} file paths")
 
-    # Filter current files by reader availability (same as seq_map_readers does)
-    filtered_current_files = {}
-    for file_path, content in current_files.items():
-        extension = os.path.basename(file_path).split('.')[-1].lower() if '.' in file_path else ''
-        reader = get_reader_by_extension(extension)
-        if reader is not None:
-            filtered_current_files[file_path] = content
-        else:
-            print(f"[DEBUG] Filtering out file without reader: {file_path} (extension: {extension})")
+    previous_file_paths = set(files_data.keys())
     
-    print(f"[DEBUG] Filtered current files: {len(current_files)} -> {len(filtered_current_files)}")
-    current_files = filtered_current_files
+    print(f"[DEBUG] Phase 1: Current file set size: {len(current_file_paths)}")
+    print(f"[DEBUG] Phase 1: Previous file set size: {len(previous_file_paths)}")
+    print(f"[DEBUG] Phase 1: Sets equal: {current_file_paths == previous_file_paths}")
 
-    # Compare file sets
-    current_file_set = set(current_files.keys())
-    previous_file_set = set(previous_files.keys())
-
-    print(f"[DEBUG] Current file set size: {len(current_file_set)}")
-    print(f"[DEBUG] Previous file set size: {len(previous_file_set)}")
-    print(f"[DEBUG] Sets equal: {current_file_set == previous_file_set}")
-
-    # Check for new or deleted files
-    if current_file_set != previous_file_set:
-        only_in_current = current_file_set - previous_file_set
-        only_in_previous = previous_file_set - current_file_set
+    # Quick check: different file sets
+    if current_file_paths != previous_file_paths:
+        only_in_current = current_file_paths - previous_file_paths
+        only_in_previous = previous_file_paths - current_file_paths
         if only_in_current:
-            print(f"[DEBUG] Only in current (new files): {list(only_in_current)[:5]}")
+            print(f"[DEBUG] Phase 1: Only in current (new files): {list(only_in_current)[:5]}")
         if only_in_previous:
-            print(f"[DEBUG] Only in previous (deleted files): {list(only_in_previous)[:5]}")
+            print(f"[DEBUG] Phase 1: Only in previous (deleted files): {list(only_in_previous)[:5]}")
+        print(f"[DEBUG] Phase 1: Changes detected - file sets differ")
         return True, latest_checkpoint
 
-    # Compare file contents using hashes
-    print(f"[DEBUG] Starting hash comparison for {len(current_file_set)} files...")
-    for file_path in current_file_set:
-        current_hash = compute_file_hash(current_files[file_path])
-        previous_hash = compute_file_hash(previous_files.get(file_path, b''))
+    # === PHASE 2: Metadata Comparison (Fast Path) ===
+    print(f"[DEBUG] Phase 2: Starting metadata comparison for {len(current_file_paths)} files")
+    
+    files_to_hash = []  # Files that need hash comparison
+    
+    for file_path in current_file_paths:
+        prev_file_data = files_data[file_path]
         
-        if current_hash != previous_hash:
-            print(f"[DEBUG] Hash mismatch for {file_path}")
-            print(f"[DEBUG]   Current hash: {current_hash}")
-            print(f"[DEBUG]   Previous hash: {previous_hash}")
+        # Get current file metadata using stat (instant, no content read)
+        try:
+            current_meta = get_file_metadata(file_path)
+        except OSError as e:
+            print(f"[DEBUG] Phase 2: Cannot stat file {file_path}: {e}")
+            return True, latest_checkpoint  # File inaccessible, treat as changed
+        
+        # Handle both new format (dict with metadata) and legacy (just content)
+        if isinstance(prev_file_data, dict):
+            prev_size = prev_file_data.get('size')
+            prev_mtime = prev_file_data.get('mtime')
+            
+            # If size and mtime match, assume no change (skip hashing)
+            if prev_size is not None and prev_mtime is not None:
+                if current_meta['size'] == prev_size and current_meta['mtime'] == prev_mtime:
+                    # Metadata matches - file unchanged, skip to next
+                    continue
+        
+        # Either no metadata or metadata differs - need to hash
+        files_to_hash.append(file_path)
+    
+    print(f"[DEBUG] Phase 2: Metadata comparison complete - {len(files_to_hash)} files need hash comparison")
+    
+    # No candidates means no changes
+    if not files_to_hash:
+        print(f"[DEBUG] Phase 2: No changes detected - all metadata matches")
+        return False, latest_checkpoint
+
+    # === PHASE 3: Hash Comparison (Slow Path) - Only for suspected changes ===
+    print(f"[DEBUG] Phase 3: Starting hash comparison for {len(files_to_hash)} candidate files")
+    
+    # Load current files content if not provided (only for candidates)
+    if current_files is None:
+        current_files = {}
+    
+    for file_path in files_to_hash:
+        # Get current file content
+        if file_path in current_files:
+            content = current_files[file_path]
+        else:
+            try:
+                with open(file_path, 'rb') as f:
+                    content = f.read()
+                current_files[file_path] = content  # Cache for potential reuse
+            except Exception as e:
+                print(f"[DEBUG] Phase 3: Failed to read file {file_path}: {type(e).__name__}: {e}")
+                return True, latest_checkpoint
+        
+        # Compute current hash
+        current_hash = compute_file_hash(content)
+        
+        # Get previous hash
+        prev_file_data = files_data[file_path]
+        if isinstance(prev_file_data, dict):
+            prev_hash = prev_file_data.get('hash')
+            if prev_hash is None:
+                # No hash stored (shouldn't happen with new format), need to decrypt
+                try:
+                    encrypted_content = prev_file_data.get('content')
+                    if encrypted_content:
+                        prev_content = crypt.decrypt(encrypted_content)
+                        prev_hash = compute_file_hash(prev_content)
+                    else:
+                        print(f"[DEBUG] Phase 3: No content for {file_path}")
+                        return True, latest_checkpoint
+                except Exception as e:
+                    print(f"[DEBUG] Phase 3: Failed to decrypt {file_path}: {e}")
+                    return True, latest_checkpoint
+        else:
+            # Legacy format - need to decrypt and hash
+            try:
+                prev_content = crypt.decrypt(prev_file_data)
+                prev_hash = compute_file_hash(prev_content)
+            except Exception as e:
+                print(f"[DEBUG] Phase 3: Failed to decrypt legacy format for {file_path}: {e}")
+                return True, latest_checkpoint
+        
+        if current_hash != prev_hash:
+            print(f"[DEBUG] Phase 3: Hash mismatch for {file_path}")
+            print(f"[DEBUG] Phase 3:   Current hash: {current_hash}")
+            print(f"[DEBUG] Phase 3:   Previous hash: {prev_hash}")
             return True, latest_checkpoint
 
-    print(f"[DEBUG] All hashes match - no changes detected")
+    print(f"[DEBUG] Phase 3: All hashes match - no changes detected")
     return False, latest_checkpoint

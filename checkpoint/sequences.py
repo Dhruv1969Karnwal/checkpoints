@@ -2,6 +2,7 @@ import json
 import os
 from argparse import Namespace
 from collections import OrderedDict
+from datetime import datetime, timezone
 from itertools import count
 from multiprocessing import cpu_count
 from tempfile import TemporaryDirectory as InTemporaryDirectory
@@ -12,10 +13,14 @@ from joblib import Parallel, delayed
 from rich.progress import Progress, SpinnerColumn
 
 from checkpoint import __version__ as version
+from checkpoint.constants import CHECKPOINT_FORMAT_VERSION
 from checkpoint.crypt import Crypt, generate_key
 from checkpoint.io import IO
 from checkpoint.readers import get_all_readers
-from checkpoint.trace import TraceGenerator, has_changes
+from checkpoint.trace import (
+    TraceGenerator, compute_file_hash, get_file_metadata, has_changes,
+    is_legacy_checkpoint
+)
 from checkpoint.utils import LogColors, get_reader_by_extension, Logger
 
 _logger = Logger()
@@ -533,7 +538,7 @@ class IOSequence(Sequence):
         return contents
 
     def seq_encrypt_files(self, contents):
-        """Encrypt the read files.
+        """Encrypt the read files and return new format with metadata.
 
         Parameters
         ----------
@@ -543,10 +548,13 @@ class IOSequence(Sequence):
         Returns
         -------
         dict
-            Dictionary of file paths and their encrypted content.
+            Dictionary with new checkpoint format containing:
+            - version: Checkpoint format version
+            - created_at: ISO timestamp
+            - files: Dict of file paths to their encrypted content and metadata
         """
         # TODO: Parallelize this
-        path2content = {}
+        files_data = {}
         # Use dest_dir for .checkpoint path (where the key is stored)
         crypt_obj = Crypt(key='crypt.key', key_path=os.path.join(
             self.dest_dir, '.checkpoint'))
@@ -554,9 +562,40 @@ class IOSequence(Sequence):
         for content in contents:
             for obj in content:
                 path = list(obj.keys())[0]
-                path2content[path] = crypt_obj.encrypt(path)
+                file_content = obj[path]
+                
+                # Ensure content is bytes for hashing
+                if isinstance(file_content, str):
+                    content_bytes = file_content.encode('utf-8')
+                else:
+                    content_bytes = file_content
+                
+                # Get file metadata
+                try:
+                    metadata = get_file_metadata(path)
+                except OSError:
+                    # File might not exist or be accessible, use defaults
+                    metadata = {'size': 0, 'mtime': 0}
+                
+                # Compute hash of original content (requires bytes)
+                content_hash = compute_file_hash(content_bytes)
+                
+                # Encrypt the file content
+                encrypted_content = crypt_obj.encrypt(file_content)
+                
+                files_data[path] = {
+                    'content': encrypted_content,
+                    'hash': content_hash,
+                    'size': metadata['size'],
+                    'mtime': metadata['mtime']
+                }
 
-        return path2content
+        # Return new format with metadata
+        return {
+            'version': CHECKPOINT_FORMAT_VERSION,
+            'created_at': datetime.now(timezone.utc).isoformat(),
+            'files': files_data
+        }
 
 
 class CheckpointSequence(Sequence):
@@ -717,6 +756,8 @@ class CheckpointSequence(Sequence):
         ----------
         enc_files: dict
             Dictionary of encrypted file paths and their content.
+            Can be in legacy format (path→encrypted_content) or
+            new format (with 'version', 'created_at', 'files' keys).
         checkpoint_path: str
             Path to the checkpoint directory.
         """
@@ -724,8 +765,23 @@ class CheckpointSequence(Sequence):
         _key = os.path.join(self.dest_dir, '.checkpoint')
         crypt = Crypt(key='crypt.key', key_path=_key)
 
+        # Handle both legacy and new checkpoint formats
+        if is_legacy_checkpoint(enc_files):
+            # Legacy format: direct path→encrypted_content mapping
+            files_data = enc_files
+        else:
+            # New format: files are nested under 'files' key
+            files_data = enc_files.get('files', {})
+
         current_files = {}
-        for file_path, encrypted_content in enc_files.items():
+        for file_path, file_info in files_data.items():
+            # In new format, file_info is a dict with 'content', 'hash', etc.
+            # In legacy format, file_info is just the encrypted content string
+            if isinstance(file_info, dict):
+                encrypted_content = file_info['content']
+            else:
+                encrypted_content = file_info
+            
             content = crypt.decrypt(encrypted_content)
             current_files[file_path] = content
 
@@ -750,8 +806,19 @@ class CheckpointSequence(Sequence):
                 with open(previous_checkpoint_path, 'r') as prev_file:
                     prev_enc_files = json.load(prev_file)
 
+                # Handle both legacy and new checkpoint formats for previous checkpoint
+                if is_legacy_checkpoint(prev_enc_files):
+                    prev_files_data = prev_enc_files
+                else:
+                    prev_files_data = prev_enc_files.get('files', {})
+
                 previous_files = {}
-                for file_path, encrypted_content in prev_enc_files.items():
+                for file_path, file_info in prev_files_data.items():
+                    if isinstance(file_info, dict):
+                        encrypted_content = file_info['content']
+                    else:
+                        encrypted_content = file_info
+                    
                     content = crypt.decrypt(encrypted_content)
                     previous_files[file_path] = content
 
@@ -819,9 +886,24 @@ class CheckpointSequence(Sequence):
         with open(config_path, 'w+') as config_file:
             json.dump(checkpoint_config, config_file, indent=4)
 
+        # Handle both legacy and new checkpoint formats
+        if is_legacy_checkpoint(checkpoint_dict):
+            # Legacy format: direct path→encrypted_content mapping
+            files_data = checkpoint_dict
+        else:
+            # New format: files are nested under 'files' key
+            files_data = checkpoint_dict.get('files', {})
+
         # Restore files to source_dir
-        for file, content in checkpoint_dict.items():
-            content = crypt.decrypt(content)
+        for file, file_info in files_data.items():
+            # In new format, file_info is a dict with 'content', 'hash', etc.
+            # In legacy format, file_info is just the encrypted content string
+            if isinstance(file_info, dict):
+                encrypted_content = file_info['content']
+            else:
+                encrypted_content = file_info
+            
+            content = crypt.decrypt(encrypted_content)
             _io.write(file, 'wb+', content)
 
     def seq_version(self):

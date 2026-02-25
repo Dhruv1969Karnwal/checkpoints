@@ -67,7 +67,7 @@ class Crypt:
         if isfile:
             content = self._io.read(file, mode='rb')
         else:
-            content = file
+            content = file if isinstance(file, bytes) else file.encode('utf-8')
 
         for _ in range(self.iterations):
             content = self._fernet.encrypt(content)

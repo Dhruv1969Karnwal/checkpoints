@@ -22,3 +22,6 @@ TRACE_FILENAME = 'trace.json'
 
 #: File extensions that are considered text files for line-level diff
 TEXT_EXTENSIONS = set(FILE_READER2EXTENSIONS["TEXT_READER"])
+
+#: Checkpoint format version for the optimized format with metadata
+CHECKPOINT_FORMAT_VERSION = "3.0.0"
