@@ -2,6 +2,10 @@ import os
 from os.path import isdir
 from os.path import join as pjoin
 from shutil import rmtree
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from checkpoint.exclusion import ExclusionConfig
 
 
 class IO:
@@ -21,7 +25,14 @@ class IO:
         `s`: IO has limited permissions (R/A)
     """
 
-    def __init__(self, path=None, mode="a", ignore_dirs=None, lazy=True):
+    def __init__(
+        self,
+        path=None,
+        mode="a",
+        ignore_dirs=None,
+        lazy=True,
+        exclusion_config: "ExclusionConfig" = None,
+    ):
         """Initialize the IO class.
 
         Parameters
@@ -34,15 +45,20 @@ class IO:
             `m`: IO has moderate permissions (R/W/A)
             `s`: IO has limited permissions (R/A)
         ignore_dirs: list
-            List of directories to ignore
+            List of directories to ignore (merged with exclusion config)
         lazy: bool, optional
             If True, the IO class will not update sub_dirs and files
+        exclusion_config: ExclusionConfig, optional
+            Configuration for the three-tier exclusion system.
+            If provided, the ExclusionManager will be used for filtering.
         """
         self._path = str()
         self._mode = str()
         self.ignore_dirs = ignore_dirs or []
         self.files = []
         self.sub_dirs = []
+        self._exclusion_config = exclusion_config
+        self._exclusion_manager = None
 
         self.lazy = lazy
 
@@ -67,6 +83,13 @@ class IO:
                               'm': [*'rwa', 'wb', 'rb'],
                               's': [*'ra', 'rb']}
 
+        # Initialize exclusion manager if config is provided
+        if self._exclusion_config is not None:
+            from checkpoint.exclusion import ExclusionManager
+            # Merge ignore_dirs into the exclusion config
+            self._exclusion_config.custom_dirs.extend(self.ignore_dirs)
+            self._exclusion_manager = ExclusionManager(self._path, self._exclusion_config)
+
         if self.lazy:
             self.files = []
             self.sub_dirs = []
@@ -84,20 +107,63 @@ class IO:
         self.files.clear()
         self.sub_dirs.clear()
 
-        for path, subdirs, files in os.walk(path):
-            if all(dir not in path for dir in self.ignore_dirs):
+        # Use ExclusionManager if available
+        if self._exclusion_manager is not None:
+            for root, dirs, files in os.walk(path):
+                # Filter directories in-place
+                dirs[:] = [
+                    d for d in dirs
+                    if not self._exclusion_manager.should_exclude(
+                        pjoin(root, d), is_directory=True
+                    ).excluded
+                ]
+                
                 for file in files:
-                    self.files.append(pjoin(path, file))
+                    if not self._exclusion_manager.should_exclude(
+                        pjoin(root, file), is_directory=False
+                    ).excluded:
+                        self.files.append(pjoin(root, file))
 
-                for subdir in subdirs:
-                    self.sub_dirs.append(pjoin(path, subdir))
+                for subdir in dirs:
+                    self.sub_dirs.append(pjoin(root, subdir))
+        else:
+            # Fallback to simple ignore_dirs filtering
+            for path, subdirs, files in os.walk(path):
+                if all(dir not in path for dir in self.ignore_dirs):
+                    for file in files:
+                        self.files.append(pjoin(path, file))
+
+                    for subdir in subdirs:
+                        self.sub_dirs.append(pjoin(path, subdir))
 
     def walk_directory(self):
-        """Walk through the root directory."""
-        for root, _, files in os.walk(self.path):
-            if all(dir not in root for dir in self.ignore_dirs):
+        """Walk through the root directory.
+        
+        Uses the ExclusionManager if available, otherwise falls back
+        to simple ignore_dirs filtering.
+        """
+        # Use ExclusionManager if available
+        if self._exclusion_manager is not None:
+            for root, dirs, files in os.walk(self.path):
+                # Filter directories in-place
+                dirs[:] = [
+                    d for d in dirs
+                    if not self._exclusion_manager.should_exclude(
+                        pjoin(root, d), is_directory=True
+                    ).excluded
+                ]
+                
                 for file in files:
-                    yield [root, file]
+                    if not self._exclusion_manager.should_exclude(
+                        pjoin(root, file), is_directory=False
+                    ).excluded:
+                        yield [root, file]
+        else:
+            # Fallback to simple ignore_dirs filtering
+            for root, _, files in os.walk(self.path):
+                if all(dir not in root for dir in self.ignore_dirs):
+                    for file in files:
+                        yield [root, file]
 
     def _validate_mode(self, mode):
         if mode not in self.mode_mappings[self.mode]:

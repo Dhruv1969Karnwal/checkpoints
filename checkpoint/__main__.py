@@ -143,9 +143,36 @@ def run(args=None):
         "--ignore-dirs",
         "-i",
         nargs="+",
-        default=[".git", ".idea", ".vscode",
-                 ".venv", "node_modules", "__pycache__" , "venv"],
-        help="Ignore directories."
+        default=[],
+        help="Additional directories to ignore (merged with default exclusions)."
+    )
+
+    checkpoint_arg_parser.add_argument(
+        "--no-explicit",
+        action="store_true",
+        default=False,
+        help="Disable Tier 1 explicit rules (well-known artifacts exclusion)."
+    )
+
+    checkpoint_arg_parser.add_argument(
+        "--no-gitignore",
+        action="store_true",
+        default=False,
+        help="Disable Tier 2 .gitignore parsing."
+    )
+
+    checkpoint_arg_parser.add_argument(
+        "--no-heuristics",
+        action="store_true",
+        default=False,
+        help="Disable Tier 3 heuristic analysis (binary/large file detection)."
+    )
+
+    checkpoint_arg_parser.add_argument(
+        "--max-file-size",
+        type=int,
+        default=10,
+        help="Maximum file size in MB (default: 10). Files larger than this will be excluded."
     )
 
     checkpoint_arg_parser.add_argument(
@@ -211,6 +238,17 @@ def run(args=None):
         # Store resolved paths on args for CLISequence to access
         parsed_args.source_dir = source_dir
         parsed_args.dest_dir = dest_dir
+
+        # Create exclusion configuration from CLI arguments
+        from checkpoint.exclusion import ExclusionConfig
+        exclusion_config = ExclusionConfig.from_cli_args(
+            no_explicit=parsed_args.no_explicit,
+            no_gitignore=parsed_args.no_gitignore,
+            no_heuristics=parsed_args.no_heuristics,
+            max_file_size_mb=parsed_args.max_file_size,
+            ignore_dirs=parsed_args.ignore_dirs,
+        )
+        parsed_args.exclusion_config = exclusion_config
 
         cli_sequence = CLISequence(
             arg_parser=checkpoint_arg_parser, args=parsed_args, terminal_log=True, env='CLI')

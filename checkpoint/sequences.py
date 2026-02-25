@@ -350,7 +350,7 @@ class IOSequence(Sequence):
 
     def __init__(self, sequence_name='IO_Sequence', order_dict=None,
                  source_dir=None, dest_dir=None, root_dir=None, ignore_dirs=None,
-                 num_cores=None, terminal_log=False, env='UI'):
+                 num_cores=None, terminal_log=False, env='UI', exclusion_config=None):
         """Initialize the IO sequence class.
 
         Default execution sequence is:
@@ -379,6 +379,8 @@ class IOSequence(Sequence):
             Number of cores to be used for parallel processing.
         terminal_log: bool, optional
             If True, messages will be logged to the terminal
+        exclusion_config: ExclusionConfig, optional
+            Configuration for the three-tier exclusion system.
         """
         self.default_order_dict = {
             'seq_walk_directories': 4,
@@ -407,7 +409,9 @@ class IOSequence(Sequence):
         if self.source_dir == self.dest_dir:
             self.ignore_dirs.append('.checkpoint')
 
-        self.io = IO(self.source_dir, ignore_dirs=self.ignore_dirs)
+        self.exclusion_config = exclusion_config
+        self.io = IO(self.source_dir, ignore_dirs=self.ignore_dirs,
+                     exclusion_config=exclusion_config)
         self.num_cores = num_cores or cpu_count()
 
     def seq_walk_directories(self):
@@ -559,7 +563,8 @@ class CheckpointSequence(Sequence):
     """Sequence to perform checkpoint operations."""
 
     def __init__(self, sequence_name, order_dict, source_dir, dest_dir, ignore_dirs,
-                 terminal_log=False, env='UI', checkpoint_type=None, subtype=None, force=False):
+                 terminal_log=False, env='UI', checkpoint_type=None, subtype=None, 
+                 force=False, exclusion_config=None):
         """Initialize the CheckpointSequence class.
 
         Parameters
@@ -582,6 +587,8 @@ class CheckpointSequence(Sequence):
             Optional subtype for the checkpoint (saved to trace.json).
         force: bool, optional
             If True, create checkpoint even if no changes detected. Default is False.
+        exclusion_config: ExclusionConfig, optional
+            Configuration for the three-tier exclusion system.
         """
         self.sequence_name = sequence_name
         self.order_dict = order_dict
@@ -593,6 +600,7 @@ class CheckpointSequence(Sequence):
         self.checkpoint_type = checkpoint_type
         self.subtype = subtype
         self.force = force
+        self.exclusion_config = exclusion_config
         super(CheckpointSequence, self).__init__(sequence_name, order_dict,
                                                  terminal_log=terminal_log, env=env)
 
@@ -661,7 +669,8 @@ class CheckpointSequence(Sequence):
         _io_sequence = IOSequence(source_dir=self.source_dir,
                                   dest_dir=self.dest_dir,
                                   ignore_dirs=self.ignore_dirs,
-                                  terminal_log=self.terminal_log, env=self.env)
+                                  terminal_log=self.terminal_log, env=self.env,
+                                  exclusion_config=self.exclusion_config)
 
         enc_files = _io_sequence.execute_sequence(pass_args=True)[-1]
 
@@ -902,6 +911,7 @@ class CLISequence(Sequence):
         _checkpoint_type = getattr(args, 'type', None)
         _subtype = getattr(args, 'subtype', None)
         _force = getattr(args, 'force', False)
+        _exclusion_config = getattr(args, 'exclusion_config', None)
         _helper_actions = ['seq_init_checkpoint', 'seq_version']
 
         # Resolve source_dir and dest_dir from args
@@ -924,6 +934,7 @@ class CLISequence(Sequence):
         _checkpoint_sequence = CheckpointSequence(
             _name, order_dict, _source, _dest, _ignore_dirs,
             terminal_log=self.terminal_log, env=self.env,
-            checkpoint_type=_checkpoint_type, subtype=_subtype, force=_force)
+            checkpoint_type=_checkpoint_type, subtype=_subtype, force=_force,
+            exclusion_config=_exclusion_config)
         action_function = getattr(_checkpoint_sequence, action)
         action_function()
