@@ -15,7 +15,7 @@ from checkpoint import __version__ as version
 from checkpoint.crypt import Crypt, generate_key
 from checkpoint.io import IO
 from checkpoint.readers import get_all_readers
-from checkpoint.trace import TraceGenerator
+from checkpoint.trace import TraceGenerator, has_changes
 from checkpoint.utils import LogColors, get_reader_by_extension, Logger
 
 _logger = Logger()
@@ -248,7 +248,12 @@ class Sequence:
                     LogColors.SUCCESS, LogColors.BOLD], timestamp=True, log_type="ERROR")
 
             self._stop_progress_bars()
-            self._progress.console.clear_live()
+            # Only clear_live if progress was started (not for nested sequences)
+            if self._progress_state == "started":
+                try:
+                    self._progress.console.clear_live()
+                except (IndexError, RuntimeError):
+                    pass  # Already cleared or not in live context
             self.on_sequence_end(self)
 
         elif execution_policy == 'increasing_order':
@@ -554,7 +559,7 @@ class CheckpointSequence(Sequence):
     """Sequence to perform checkpoint operations."""
 
     def __init__(self, sequence_name, order_dict, source_dir, dest_dir, ignore_dirs,
-                 terminal_log=False, env='UI', checkpoint_type=None):
+                 terminal_log=False, env='UI', checkpoint_type=None, subtype=None, force=False):
         """Initialize the CheckpointSequence class.
 
         Parameters
@@ -572,7 +577,11 @@ class CheckpointSequence(Sequence):
         terminal_log: bool, optional
             If True, messages will be logged to the terminal
         checkpoint_type: str, optional
-            Type of checkpoint ('human' or 'ai'). If provided, generates trace.json.
+            Type of checkpoint ('human', 'ai', or 'codebase'). If provided, generates trace.json.
+        subtype: str, optional
+            Optional subtype for the checkpoint (saved to trace.json).
+        force: bool, optional
+            If True, create checkpoint even if no changes detected. Default is False.
         """
         self.sequence_name = sequence_name
         self.order_dict = order_dict
@@ -582,6 +591,8 @@ class CheckpointSequence(Sequence):
         self.root_dir = source_dir
         self.ignore_dirs = ignore_dirs
         self.checkpoint_type = checkpoint_type
+        self.subtype = subtype
+        self.force = force
         super(CheckpointSequence, self).__init__(sequence_name, order_dict,
                                                  terminal_log=terminal_log, env=env)
 
@@ -620,6 +631,27 @@ class CheckpointSequence(Sequence):
             self.dest_dir, '.checkpoint', self.sequence_name)
         if os.path.isdir(checkpoint_path):
             raise ValueError(f'Checkpoint {self.sequence_name} already exists')
+
+        # Pre-creation change detection
+        # Build ignore_dirs for change detection - add .checkpoint if source == dest
+        _change_detection_ignore_dirs = list(self.ignore_dirs)
+        if self.source_dir == self.dest_dir:
+            _change_detection_ignore_dirs.append('.checkpoint')
+        
+        changes_detected, previous_checkpoint = has_changes(
+            source_dir=self.source_dir,
+            dest_dir=self.dest_dir,
+            ignore_dirs=_change_detection_ignore_dirs
+        )
+
+        if not changes_detected:
+            if not self.force:
+                print("[yellow]No changes detected since the last checkpoint. "
+                      "Use --force to create a checkpoint anyway.[/yellow]")
+                return
+            else:
+                print("[yellow]No changes detected, but --force specified. "
+                      "Creating checkpoint anyway.[/yellow]")
 
         # IO for destination (write checkpoint data)
         _io = IO(path=self.dest_dir, mode="a",
@@ -719,7 +751,8 @@ class CheckpointSequence(Sequence):
             checkpoint_name=self.sequence_name,
             checkpoint_type=self.checkpoint_type,
             source_dir=self.source_dir,
-            dest_dir=self.dest_dir
+            dest_dir=self.dest_dir,
+            subtype=self.subtype
         )
         trace_generator.generate_and_save(
             current_files=current_files,
@@ -867,6 +900,8 @@ class CLISequence(Sequence):
         _name = args.name
         _ignore_dirs = args.ignore_dirs or []
         _checkpoint_type = getattr(args, 'type', None)
+        _subtype = getattr(args, 'subtype', None)
+        _force = getattr(args, 'force', False)
         _helper_actions = ['seq_init_checkpoint', 'seq_version']
 
         # Resolve source_dir and dest_dir from args
@@ -889,6 +924,6 @@ class CLISequence(Sequence):
         _checkpoint_sequence = CheckpointSequence(
             _name, order_dict, _source, _dest, _ignore_dirs,
             terminal_log=self.terminal_log, env=self.env,
-            checkpoint_type=_checkpoint_type)
+            checkpoint_type=_checkpoint_type, subtype=_subtype, force=_force)
         action_function = getattr(_checkpoint_sequence, action)
         action_function()

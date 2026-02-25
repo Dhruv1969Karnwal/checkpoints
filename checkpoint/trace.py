@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from checkpoint.constants import TEXT_EXTENSIONS, TRACE_FILENAME
+from checkpoint.utils import get_reader_by_extension
 
 
 def compute_file_hash(content: bytes) -> str:
@@ -203,7 +204,8 @@ def generate_trace(
     checkpoint_type: str,
     current_files: Dict[str, bytes],
     previous_files: Optional[Dict[str, bytes]] = None,
-    previous_checkpoint_name: Optional[str] = None
+    previous_checkpoint_name: Optional[str] = None,
+    subtype: Optional[str] = None
 ) -> Dict[str, Any]:
     """Generate the complete trace.json structure.
 
@@ -212,13 +214,15 @@ def generate_trace(
     checkpoint_name: str
         Name of the current checkpoint.
     checkpoint_type: str
-        Type of checkpoint ('human' or 'ai').
+        Type of checkpoint ('human', 'ai', or 'codebase').
     current_files: Dict[str, bytes]
         Dictionary mapping file paths to their content in the current checkpoint.
     previous_files: Optional[Dict[str, bytes]]
         Dictionary mapping file paths to their content in the previous checkpoint.
     previous_checkpoint_name: Optional[str]
         Name of the previous checkpoint.
+    subtype: Optional[str]
+        Optional subtype for the checkpoint.
 
     Returns
     -------
@@ -240,6 +244,10 @@ def generate_trace(
             'deleted_files': 0,
         }
     }
+
+    # Add subtype to trace if provided
+    if subtype is not None:
+        trace['checkpoint_subtype'] = subtype
 
     # Track all files we've processed
     processed_files = set()
@@ -459,7 +467,8 @@ class TraceGenerator:
         checkpoint_name: str,
         checkpoint_type: str,
         source_dir: str,
-        dest_dir: Optional[str] = None
+        dest_dir: Optional[str] = None,
+        subtype: Optional[str] = None
     ):
         """Initialize the TraceGenerator.
 
@@ -468,15 +477,18 @@ class TraceGenerator:
         checkpoint_name: str
             Name of the current checkpoint.
         checkpoint_type: str
-            Type of checkpoint ('human' or 'ai').
+            Type of checkpoint ('human', 'ai', or 'codebase').
         source_dir: str
             Source directory of the project (for reference).
         dest_dir: str, optional
             Destination directory for checkpoint storage.
             Defaults to source_dir if not provided.
+        subtype: str, optional
+            Optional subtype for the checkpoint (saved to trace.json).
         """
         self.checkpoint_name = checkpoint_name
         self.checkpoint_type = checkpoint_type
+        self.subtype = subtype
         self.source_dir = source_dir
         self.dest_dir = dest_dir or source_dir
         # Keep root_dir as an alias for source_dir for backward compatibility
@@ -541,9 +553,185 @@ class TraceGenerator:
             checkpoint_type=self.checkpoint_type,
             current_files=current_files,
             previous_files=previous_files,
-            previous_checkpoint_name=previous_checkpoint_name
+            previous_checkpoint_name=previous_checkpoint_name,
+            subtype=self.subtype
         )
 
         # Save trace to destination directory
         checkpoint_dir = os.path.join(self.dest_dir, '.checkpoint', self.checkpoint_name)
         return save_trace(trace_data, checkpoint_dir)
+
+
+def has_changes(
+    source_dir: str,
+    dest_dir: str,
+    ignore_dirs: List[str],
+    current_files: Optional[Dict[str, bytes]] = None
+) -> Tuple[bool, Optional[str]]:
+    """Check if there are any changes compared to the latest checkpoint.
+
+    This function performs a lightweight comparison between the current files
+    and the latest checkpoint to determine if any changes exist.
+
+    Parameters
+    ----------
+    source_dir: str
+        Path to the source directory to check.
+    dest_dir: str
+        Path to the destination directory containing .checkpoint folder.
+    ignore_dirs: List[str]
+        List of directories to ignore during comparison.
+    current_files: Optional[Dict[str, bytes]]
+        Pre-computed current files dictionary. If None, files will be read
+        from the source directory.
+
+    Returns
+    -------
+    Tuple[bool, Optional[str]]
+        A tuple containing:
+        - bool: True if changes detected, False otherwise.
+        - Optional[str]: Name of the previous checkpoint, or None if no previous checkpoint exists.
+    """
+    from checkpoint.crypt import Crypt
+    from checkpoint.io import IO
+
+    # Check if .checkpoint directory exists
+    checkpoint_base = os.path.join(dest_dir, '.checkpoint')
+    print(f"[DEBUG] Checking for checkpoint base: {checkpoint_base}")
+    print(f"[DEBUG] Checkpoint base exists: {os.path.exists(checkpoint_base)}")
+    
+    if not os.path.exists(checkpoint_base):
+        print(f"[DEBUG] No checkpoint base found - treating as first checkpoint")
+        return True, None  # No checkpoint exists, treat as having changes (first checkpoint)
+
+    # Check if config file exists
+    config_path = os.path.join(checkpoint_base, '.config')
+    print(f"[DEBUG] Config path: {config_path}")
+    print(f"[DEBUG] Config exists: {os.path.exists(config_path)}")
+    
+    if not os.path.exists(config_path):
+        print(f"[DEBUG] No config file found - treating as having changes")
+        return True, None  # No config, treat as having changes
+
+    with open(config_path, 'r', encoding='utf-8') as config_file:
+        config = json.load(config_file)
+
+    checkpoints = config.get('checkpoints', [])
+    print(f"[DEBUG] Checkpoints in config: {checkpoints}")
+    
+    if not checkpoints:
+        print(f"[DEBUG] No checkpoints in config - treating as first checkpoint")
+        return True, None  # No checkpoints, treat as having changes (first checkpoint)
+
+    # Get the latest checkpoint
+    latest_checkpoint = checkpoints[-1]
+    latest_checkpoint_path = os.path.join(
+        checkpoint_base, latest_checkpoint, f'{latest_checkpoint}.json'
+    )
+    print(f"[DEBUG] Latest checkpoint: {latest_checkpoint}")
+    print(f"[DEBUG] Latest checkpoint path: {latest_checkpoint_path}")
+    print(f"[DEBUG] Checkpoint file exists: {os.path.exists(latest_checkpoint_path)}")
+
+    if not os.path.exists(latest_checkpoint_path):
+        print(f"[DEBUG] Checkpoint file missing - treating as having changes")
+        return True, None  # Checkpoint file missing, treat as having changes
+
+    # Load the encryption key and decrypt previous checkpoint files
+    try:
+        crypt = Crypt(key='crypt.key', key_path=checkpoint_base)
+        print(f"[DEBUG] Crypt initialized successfully")
+    except Exception as e:
+        print(f"[DEBUG] Crypt initialization failed: {type(e).__name__}: {e}")
+        return True, None  # Can't decrypt, treat as having changes
+
+    # Load previous checkpoint files
+    previous_files = {}
+    try:
+        with open(latest_checkpoint_path, 'r', encoding='utf-8') as f:
+            prev_enc_files = json.load(f)
+
+        print(f"[DEBUG] Previous checkpoint contains {len(prev_enc_files)} encrypted files")
+
+        for file_path, encrypted_content in prev_enc_files.items():
+            try:
+                content = crypt.decrypt(encrypted_content)
+                previous_files[file_path] = content
+            except Exception as e:
+                print(f"[DEBUG] Failed to decrypt file {file_path}: {type(e).__name__}: {e}")
+                return True, latest_checkpoint
+        
+        print(f"[DEBUG] Successfully decrypted {len(previous_files)} previous files")
+        if previous_files:
+            sample_paths = list(previous_files.keys())[:3]
+            print(f"[DEBUG] Sample previous file paths: {sample_paths}")
+    except Exception as e:
+        print(f"[DEBUG] Failed to load previous checkpoint: {type(e).__name__}: {e}")
+        return True, latest_checkpoint
+
+    # Get current files if not provided
+    if current_files is None:
+        current_files = {}
+        source_io = IO(path=source_dir, ignore_dirs=ignore_dirs)
+        
+        print(f"[DEBUG] Reading current files from: {source_dir}")
+        print(f"[DEBUG] Ignore dirs: {ignore_dirs}")
+        
+        for root, file in source_io.walk_directory():
+            file_path = os.path.join(root, file)
+            try:
+                with open(file_path, 'rb') as f:
+                    current_files[file_path] = f.read()
+            except Exception as e:
+                print(f"[DEBUG] Failed to read file {file_path}: {type(e).__name__}: {e}")
+                return True, latest_checkpoint
+        
+        print(f"[DEBUG] Read {len(current_files)} current files")
+        if current_files:
+            sample_paths = list(current_files.keys())[:3]
+            print(f"[DEBUG] Sample current file paths: {sample_paths}")
+
+    # Filter current files by reader availability (same as seq_map_readers does)
+    filtered_current_files = {}
+    for file_path, content in current_files.items():
+        extension = os.path.basename(file_path).split('.')[-1].lower() if '.' in file_path else ''
+        reader = get_reader_by_extension(extension)
+        if reader is not None:
+            filtered_current_files[file_path] = content
+        else:
+            print(f"[DEBUG] Filtering out file without reader: {file_path} (extension: {extension})")
+    
+    print(f"[DEBUG] Filtered current files: {len(current_files)} -> {len(filtered_current_files)}")
+    current_files = filtered_current_files
+
+    # Compare file sets
+    current_file_set = set(current_files.keys())
+    previous_file_set = set(previous_files.keys())
+
+    print(f"[DEBUG] Current file set size: {len(current_file_set)}")
+    print(f"[DEBUG] Previous file set size: {len(previous_file_set)}")
+    print(f"[DEBUG] Sets equal: {current_file_set == previous_file_set}")
+
+    # Check for new or deleted files
+    if current_file_set != previous_file_set:
+        only_in_current = current_file_set - previous_file_set
+        only_in_previous = previous_file_set - current_file_set
+        if only_in_current:
+            print(f"[DEBUG] Only in current (new files): {list(only_in_current)[:5]}")
+        if only_in_previous:
+            print(f"[DEBUG] Only in previous (deleted files): {list(only_in_previous)[:5]}")
+        return True, latest_checkpoint
+
+    # Compare file contents using hashes
+    print(f"[DEBUG] Starting hash comparison for {len(current_file_set)} files...")
+    for file_path in current_file_set:
+        current_hash = compute_file_hash(current_files[file_path])
+        previous_hash = compute_file_hash(previous_files.get(file_path, b''))
+        
+        if current_hash != previous_hash:
+            print(f"[DEBUG] Hash mismatch for {file_path}")
+            print(f"[DEBUG]   Current hash: {current_hash}")
+            print(f"[DEBUG]   Previous hash: {previous_hash}")
+            return True, latest_checkpoint
+
+    print(f"[DEBUG] All hashes match - no changes detected")
+    return False, latest_checkpoint

@@ -152,9 +152,25 @@ def run(args=None):
         "--type",
         "-t",
         type=str,
-        help="Type of checkpoint: human or ai",
-        choices=["human", "ai"],
-        default=None
+        help="Type of checkpoint: human, ai, or codebase (default: codebase)",
+        choices=["human", "ai", "codebase"],
+        default="codebase"
+    )
+
+    checkpoint_arg_parser.add_argument(
+        "--subtype",
+        "-st",
+        type=str,
+        default=None,
+        help="Optional subtype for the checkpoint (saved to trace.json)"
+    )
+
+    checkpoint_arg_parser.add_argument(
+        "--force",
+        "-f",
+        action="store_true",
+        default=False,
+        help="Force checkpoint creation even if no changes detected."
     )
 
     if args is not None:
