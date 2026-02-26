@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 from argparse import Namespace
 from collections import OrderedDict
@@ -24,6 +25,7 @@ from checkpoint.trace import (
 from checkpoint.utils import LogColors, get_reader_by_extension, Logger
 
 _logger = Logger()
+logger = logging.getLogger(__name__)
 
 
 def migrate_config_if_needed(config_path):
@@ -93,7 +95,7 @@ class Sequence:
     """Class to represent a sequence of operations."""
 
     _progress = Progress(
-        SpinnerColumn(), *Progress.get_default_columns(), transient=False)
+        SpinnerColumn(spinner_name="line"), *Progress.get_default_columns(), transient=False)
 
     def __init__(self, sequence_name, order_dict=None, terminal_log=False, env='UI'):
         """Initialize the sequence class.
@@ -244,7 +246,9 @@ class Sequence:
                 "error": "One or more actions failed!"
             }
 
-            if self._progress.finished:
+            _tasks_finished = all(self._progress.tasks[tid].finished for tid in self._task_ids.values())
+
+            if _tasks_finished:
                 self.log(_finish_msgs["success"], [
                     LogColors.SUCCESS, LogColors.BOLD], timestamp=True, log_type="SUCCESS")
 
@@ -327,8 +331,7 @@ class Sequence:
 
     def log(self, *args, **kwargs):
         """Wrapper function for `logger.log`"""
-        if self.env == 'UI':
-            self.logger.log(*args, **kwargs)
+        self.logger.log(*args, **kwargs)
 
     @property
     def name(self):
@@ -531,10 +534,20 @@ class IOSequence(Sequence):
         """
         readers_dict, extension_dict = readers_extension
 
+        # Count total files for logging
+        total_files = sum(len(files) for files in extension_dict.values())
+        logger.debug(f"[Read] Starting to read {total_files} files...")
+        
+        for ext, files in extension_dict.items():
+            for file in files:
+                logger.debug(f"[Read] Reading: {file}")
+
         contents = \
             Parallel(self.num_cores)(delayed(readers_dict[ext].read)(files,
                                      validate=False) for (ext, files) in
                                      extension_dict.items())
+        
+        logger.debug(f"[Read] Completed reading {total_files} files")
         return contents
 
     def seq_encrypt_files(self, contents):
@@ -559,10 +572,16 @@ class IOSequence(Sequence):
         crypt_obj = Crypt(key='crypt.key', key_path=os.path.join(
             self.dest_dir, '.checkpoint'))
 
+        # Count total files for logging
+        total_files = sum(len(content) for content in contents)
+        logger.debug(f"[Encrypt] Starting encryption of {total_files} files...")
+
         for content in contents:
             for obj in content:
                 path = list(obj.keys())[0]
                 file_content = obj[path]
+                
+                logger.debug(f"[Encrypt] Processing: {path}")
                 
                 # Ensure content is bytes for hashing
                 if isinstance(file_content, str):
@@ -571,16 +590,21 @@ class IOSequence(Sequence):
                     content_bytes = file_content
                 
                 # Get file metadata
+                logger.debug(f"[Encrypt] Getting metadata for: {path}")
                 try:
                     metadata = get_file_metadata(path)
                 except OSError:
                     # File might not exist or be accessible, use defaults
                     metadata = {'size': 0, 'mtime': 0}
+                logger.debug(f"[Encrypt] Size: {metadata['size']}, Mtime: {metadata['mtime']}")
                 
                 # Compute hash of original content (requires bytes)
+                logger.debug(f"[Encrypt] Computing hash for: {path}")
                 content_hash = compute_file_hash(content_bytes)
+                logger.debug(f"[Encrypt] Hash: {content_hash}")
                 
                 # Encrypt the file content
+                logger.debug(f"[Encrypt] Encrypting: {path}")
                 encrypted_content = crypt_obj.encrypt(file_content)
                 
                 files_data[path] = {
@@ -589,6 +613,8 @@ class IOSequence(Sequence):
                     'size': metadata['size'],
                     'mtime': metadata['mtime']
                 }
+
+        logger.debug(f"[Encrypt] Completed encryption of {total_files} files")
 
         # Return new format with metadata
         return {
@@ -656,8 +682,13 @@ class CheckpointSequence(Sequence):
         # Create .checkpoint in destination directory
         _io = IO(path=self.dest_dir, mode="a",
                  ignore_dirs=self.ignore_dirs)
-        path = _io.make_dir('.checkpoint')
-        generate_key('crypt.key', path)
+        
+        checkpoint_dir = os.path.join(self.dest_dir, '.checkpoint')
+        if not os.path.exists(checkpoint_dir):
+            path = _io.make_dir('.checkpoint')
+            generate_key('crypt.key', path)
+        else:
+            path = checkpoint_dir
 
         checkpoint_config = {
             'current_checkpoint': None,
@@ -673,6 +704,10 @@ class CheckpointSequence(Sequence):
 
     def seq_create_checkpoint(self):
         """Create a new checkpoint for the target directory."""
+        # Ensure .checkpoint exists in destination
+        if not os.path.isdir(os.path.join(self.dest_dir, '.checkpoint')):
+            self.seq_init_checkpoint()
+
         # Check if checkpoint exists in destination
         checkpoint_path = os.path.join(
             self.dest_dir, '.checkpoint', self.sequence_name)
@@ -693,12 +728,15 @@ class CheckpointSequence(Sequence):
 
         if not changes_detected:
             if not self.force:
-                print("[yellow]No changes detected since the last checkpoint. "
-                      "Use --force to create a checkpoint anyway.[/yellow]")
+                self.log("No changes detected since the last checkpoint. Use --force to create a checkpoint anyway.",
+                         colors=LogColors.WARNING, timestamp=True, log_type="INFO")
                 return
             else:
-                print("[yellow]No changes detected, but --force specified. "
-                      "Creating checkpoint anyway.[/yellow]")
+                self.log("No changes detected, but --force specified. Creating checkpoint anyway.",
+                         colors=LogColors.WARNING, timestamp=True, log_type="INFO")
+
+        self.log(f"Creating checkpoint: {self.sequence_name}",
+                 colors=LogColors.INFO, timestamp=True, log_type="INFO")
 
         # IO for destination (write checkpoint data)
         _io = IO(path=self.dest_dir, mode="a",
@@ -747,7 +785,12 @@ class CheckpointSequence(Sequence):
 
         # Generate trace.json if checkpoint_type is provided
         if self.checkpoint_type:
+            self.log(f"Generating trace for checkpoint: {self.sequence_name}",
+                     colors=LogColors.INFO, timestamp=True, log_type="INFO")
             self._generate_trace(enc_files, checkpoint_path)
+
+        self.log(f"Checkpoint {self.sequence_name} created successfully!",
+                 colors=LogColors.SUCCESS, timestamp=True, log_type="SUCCESS")
 
     def _generate_trace(self, enc_files, checkpoint_path):
         """Generate trace.json for the checkpoint.
@@ -863,6 +906,10 @@ class CheckpointSequence(Sequence):
     def seq_restore_checkpoint(self):
         """Restore back to a specific checkpoint."""
         self._validate_checkpoint()
+        self.log(f"Restoring checkpoint: {self.sequence_name}",
+                 colors=LogColors.INFO, timestamp=True, log_type="INFO")
+        logger.debug(f"[Restore] Starting checkpoint restoration...")
+        
         # IO for writing to source directory
         _io = IO(path=self.source_dir, mode="a",
                  ignore_dirs=self.ignore_dirs)
@@ -890,9 +937,13 @@ class CheckpointSequence(Sequence):
         if is_legacy_checkpoint(checkpoint_dict):
             # Legacy format: direct path→encrypted_content mapping
             files_data = checkpoint_dict
+            logger.debug(f"[Restore] Checkpoint format: legacy")
         else:
             # New format: files are nested under 'files' key
             files_data = checkpoint_dict.get('files', {})
+            logger.debug(f"[Restore] Checkpoint format: new (v{checkpoint_dict.get('version', 'unknown')})")
+
+        logger.debug(f"[Restore] Files to restore: {len(files_data)}")
 
         # Restore files to source_dir
         for file, file_info in files_data.items():
@@ -903,8 +954,14 @@ class CheckpointSequence(Sequence):
             else:
                 encrypted_content = file_info
             
+            logger.debug(f"[Restore] Decrypting: {file}")
             content = crypt.decrypt(encrypted_content)
+            logger.debug(f"[Restore] Writing: {file}")
             _io.write(file, 'wb+', content)
+
+        logger.debug(f"[Restore] Completed restoration of {len(files_data)} files")
+        self.log(f"Successfully restored to checkpoint {self.sequence_name}!",
+                 colors=LogColors.SUCCESS, timestamp=True, log_type="SUCCESS")
 
     def seq_version(self):
         """Print the version of the sequence."""

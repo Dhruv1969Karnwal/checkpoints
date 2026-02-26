@@ -1,3 +1,4 @@
+import logging
 import os
 from os.path import isdir
 from os.path import join as pjoin
@@ -6,6 +7,8 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from checkpoint.exclusion import ExclusionConfig
+
+logger = logging.getLogger(__name__)
 
 
 class IO:
@@ -186,6 +189,7 @@ class IO:
             How to handle encoding errors (default: 'replace')
         """
         self._validate_mode(mode)
+        logger.debug(f"[IO] Reading file: {file}")
         if 'b' in mode:
             with open(file, mode) as f:
                 content = f.read()
@@ -208,6 +212,7 @@ class IO:
             Content to write in the file
         """
         self._validate_mode(mode)
+        logger.debug(f"[IO] Writing file: {file}")
         with open(file, mode) as f:
             f.write(content)
 

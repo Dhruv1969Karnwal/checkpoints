@@ -1,9 +1,12 @@
+import logging
 import os
 from os.path import join as pjoin
 
 from cryptography.fernet import Fernet
 
 from checkpoint import io
+
+logger = logging.getLogger(__name__)
 
 
 def generate_key(name, path=os.getcwd()):
@@ -69,6 +72,8 @@ class Crypt:
         else:
             content = file if isinstance(file, bytes) else file.encode('utf-8')
 
+        logger.debug(f"[Crypt] Encrypting {len(content)} bytes")
+
         for _ in range(self.iterations):
             content = self._fernet.encrypt(content)
 
@@ -92,6 +97,8 @@ class Crypt:
             content = self._io.read(file, mode='rb')
         else:
             content = bytes(file, 'utf-8')
+
+        logger.debug(f"[Crypt] Decrypting {len(content)} bytes")
 
         for _ in range(self.iterations):
             content = self._fernet.decrypt(content)

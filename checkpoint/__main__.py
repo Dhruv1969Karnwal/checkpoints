@@ -1,10 +1,12 @@
 import builtins
+import logging
 import os
 import warnings
 from argparse import ArgumentParser
 from typing import Tuple
 
 from rich import print as rich_print
+from rich.logging import RichHandler
 
 from checkpoint import __version__ as version
 from checkpoint.sequences import CLISequence
@@ -200,6 +202,21 @@ def run(args=None):
         help="Force checkpoint creation even if no changes detected."
     )
 
+    checkpoint_arg_parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        default=False,
+        help="Enable verbose output (INFO level)."
+    )
+
+    checkpoint_arg_parser.add_argument(
+        "--debug",
+        action="store_true",
+        default=False,
+        help="Enable debug output (DEBUG level)."
+    )
+
     if args is not None:
         run_ui = args.run_ui
     else:
@@ -215,6 +232,20 @@ def run(args=None):
     else:
         # Parse arguments and resolve paths
         parsed_args = checkpoint_arg_parser.parse_args() if args is None else args
+
+        # Configure logging
+        log_level = logging.WARNING
+        if parsed_args.debug:
+            log_level = logging.DEBUG
+        elif parsed_args.verbose:
+            log_level = logging.INFO
+
+        logging.basicConfig(
+            level=log_level,
+            format="%(message)s",
+            datefmt="[%X]",
+            handlers=[RichHandler(rich_tracebacks=True, show_path=False)]
+        )
 
         # Show deprecation warning if --path is used
         if parsed_args.path:
