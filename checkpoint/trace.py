@@ -11,7 +11,11 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from checkpoint.exclusion import ExclusionConfig
+
 
 logger = logging.getLogger(__name__)
 
@@ -709,7 +713,8 @@ def has_changes(
     source_dir: str,
     dest_dir: str,
     ignore_dirs: List[str],
-    current_files: Optional[Dict[str, bytes]] = None
+    current_files: Optional[Dict[str, bytes]] = None,
+    exclusion_config: Optional["ExclusionConfig"] = None
 ) -> Tuple[bool, Optional[str]]:
     """Check if there are any changes compared to the latest checkpoint.
 
@@ -731,6 +736,8 @@ def has_changes(
     current_files: Optional[Dict[str, bytes]]
         Pre-computed current files dictionary. If None, files will be read
         from the source directory.
+    exclusion_config: Optional["ExclusionConfig"]
+        Configuration for the three-tier exclusion system.
 
     Returns
     -------
@@ -827,7 +834,11 @@ def has_changes(
     else:
         # Get file paths by walking the directory (without reading content)
         current_file_paths = set()
-        source_io = IO(path=source_dir, ignore_dirs=ignore_dirs)
+        source_io = IO(
+            path=source_dir, 
+            ignore_dirs=ignore_dirs,
+            exclusion_config=exclusion_config
+        )
         
         logger.debug(f"[Phase 1] Walking directory: {source_dir}")
         logger.debug(f"[Phase 1] Ignore dirs: {ignore_dirs}")
@@ -835,7 +846,7 @@ def has_changes(
         for root, file in source_io.walk_directory():
             file_path = os.path.join(root, file)
             # Filter by reader availability (same as seq_map_readers does)
-            extension = os.path.basename(file_path).split('.')[-1].lower() if '.' in file_path else ''
+            extension = os.path.basename(file_path).split('.')[-1].lower()
             reader = get_reader_by_extension(extension)
             if reader is not None:
                 current_file_paths.add(file_path)

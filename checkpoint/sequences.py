@@ -723,7 +723,8 @@ class CheckpointSequence(Sequence):
         changes_detected, previous_checkpoint = has_changes(
             source_dir=self.source_dir,
             dest_dir=self.dest_dir,
-            ignore_dirs=_change_detection_ignore_dirs
+            ignore_dirs=_change_detection_ignore_dirs,
+            exclusion_config=self.exclusion_config
         )
 
         if not changes_detected:
@@ -773,7 +774,8 @@ class CheckpointSequence(Sequence):
 
         # Walk source directory for metadata
         root2file = {}
-        source_io = IO(path=self.source_dir, ignore_dirs=self.ignore_dirs)
+        source_io = IO(path=self.source_dir, ignore_dirs=self.ignore_dirs,
+                      exclusion_config=self.exclusion_config)
         for root, file in source_io.walk_directory():
             if root in root2file:
                 root2file[root].append(os.path.join(root, file))

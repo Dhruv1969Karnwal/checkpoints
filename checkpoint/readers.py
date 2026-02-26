@@ -261,12 +261,11 @@ class ByteReader(Reader):
         with InTemporaryDirectory() as tdir:
             for ext in extensions:
                 temp_file = os.path.join(tdir, f'test.{ext}')
-                with open(temp_file, 'wb') as f:
-                    f.write(b'test')
+                try:
+                    with open(temp_file, 'wb') as f:
+                        f.write(b'test')
                     self._read(temp_file)
-                invalid_idxs.append(extensions.index(ext))
-
-        for idx in invalid_idxs:
-            extensions.pop(idx)
+                except Exception:
+                    invalid_idxs.append(extensions.index(ext))
 
         return invalid_idxs
