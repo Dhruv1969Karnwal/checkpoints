@@ -23,6 +23,23 @@ from checkpoint.constants import TEXT_EXTENSIONS, TRACE_FILENAME
 from checkpoint.utils import get_reader_by_extension
 
 
+# Common binary file signatures (magic bytes) for quick detection
+BINARY_SIGNATURES = {
+    b'\x89PNG\r\n\x1a\n': 'PNG image',
+    b'GIF87a': 'GIF image',
+    b'GIF89a': 'GIF image',
+    b'\xff\xd8\xff': 'JPEG image',
+    b'PK\x03\x04': 'ZIP/Office archive',
+    b'Rar!\x1a\x07': 'RAR archive',
+    b'\x1f\x8b': 'GZIP archive',
+    b'BZh': 'BZIP2 archive',
+    b'MZ': 'Windows executable',
+    b'\x7fELF': 'Linux executable',
+    b'%PDF': 'PDF document',
+    b'SQLite': 'SQLite database',
+}
+
+
 def compute_file_hash(content: bytes) -> str:
     """Compute SHA-256 hash of file content.
 
@@ -225,6 +242,8 @@ def is_text_file(file_path: str) -> bool:
 def is_binary_content(content: bytes) -> bool:
     """Check if content appears to be binary (not text).
 
+    Uses magic bytes, null byte detection, and encoding checks.
+
     Parameters
     ----------
     content: bytes
@@ -233,10 +252,24 @@ def is_binary_content(content: bytes) -> bool:
     Returns
     -------
     bool
-        True if the content appears to be binary (not decodable as text).
+        True if the content appears to be binary.
     """
-    # Try common text encodings
-    encodings_to_try = ['utf-8', 'utf-16', 'utf-16-le', 'utf-16-be', 'latin-1']
+    if not content:
+        return False
+
+    # 1. Quick magic bytes check
+    for signature in BINARY_SIGNATURES:
+        if content.startswith(signature):
+            return True
+
+    # 2. Null byte detection (very strong indicator of binary)
+    # Most text files don't contain null bytes.
+    if b'\x00' in content:
+        return True
+
+    # 3. Try common text encodings
+    # Remove latin-1 from decisive list as it always succeeds.
+    encodings_to_try = ['utf-8', 'utf-16', 'utf-16-le', 'utf-16-be']
     
     for encoding in encodings_to_try:
         try:
@@ -245,7 +278,7 @@ def is_binary_content(content: bytes) -> bool:
         except (UnicodeDecodeError, UnicodeError):
             continue
     
-    return True  # Could not decode with any encoding, likely binary
+    return True  # Could not decode with reliable encodings, treat as binary
 
 
 def decode_text_content(content: bytes) -> Optional[Tuple[str, str]]:
