@@ -941,6 +941,28 @@ class CheckpointSequence(Sequence):
 
         logger.debug(f"[Restore] Files to restore: {len(files_data)}")
 
+        # Clean restore: delete files that are not in the checkpoint
+        self.log(f"Cleaning source directory...", colors=LogColors.INFO, timestamp=True, log_type="INFO")
+        
+        # Refresh the IO file list to include newly created untracked files
+        _io.update_paths(self.source_dir)
+        
+        # Get all local files currently in the source directory
+        current_local_files = set(_io.files)
+        checkpoint_files = set(files_data.keys())
+        
+        # Files to delete are those present locally but not in the checkpoint
+        files_to_delete = current_local_files - checkpoint_files
+        
+        for file_to_delete in files_to_delete:
+            self.log(f"Deleting untracked file: {file_to_delete}", 
+                     colors=LogColors.WARNING, timestamp=True, log_type="INFO")
+            if os.path.exists(file_to_delete):
+                try:
+                    os.remove(file_to_delete)
+                except Exception as e:
+                    logger.debug(f"[Restore] Failed to delete {file_to_delete}: {e}")
+
         # Restore files to source_dir
         for file, file_info in files_data.items():
             # In new format, file_info is a dict with 'content', 'hash', etc.

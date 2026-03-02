@@ -213,6 +213,12 @@ class IO:
         """
         self._validate_mode(mode)
         logger.debug(f"[IO] Writing file: {file}")
+        
+        # Ensure parent directory exists
+        parent_dir = os.path.dirname(file)
+        if parent_dir and not os.path.exists(parent_dir):
+            os.makedirs(parent_dir, exist_ok=True)
+            
         with open(file, mode) as f:
             f.write(content)
 
