@@ -579,15 +579,9 @@ class IOSequence(Sequence):
         for content in contents:
             for obj in content:
                 path = list(obj.keys())[0]
-                file_content = obj[path]
+                content_bytes = obj[path]
                 
                 logger.debug(f"[Encrypt] Processing: {path}")
-                
-                # Ensure content is bytes for hashing
-                if isinstance(file_content, str):
-                    content_bytes = file_content.encode('utf-8')
-                else:
-                    content_bytes = file_content
                 
                 # Get file metadata
                 logger.debug(f"[Encrypt] Getting metadata for: {path}")
@@ -598,14 +592,14 @@ class IOSequence(Sequence):
                     metadata = {'size': 0, 'mtime': 0}
                 logger.debug(f"[Encrypt] Size: {metadata['size']}, Mtime: {metadata['mtime']}")
                 
-                # Compute hash of original content (requires bytes)
+                # Compute hash of original content (already bytes)
                 logger.debug(f"[Encrypt] Computing hash for: {path}")
                 content_hash = compute_file_hash(content_bytes)
                 logger.debug(f"[Encrypt] Hash: {content_hash}")
                 
                 # Encrypt the file content
                 logger.debug(f"[Encrypt] Encrypting: {path}")
-                encrypted_content = crypt_obj.encrypt(file_content)
+                encrypted_content = crypt_obj.encrypt(content_bytes)
                 
                 files_data[path] = {
                     'content': encrypted_content,
