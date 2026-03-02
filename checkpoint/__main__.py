@@ -138,7 +138,7 @@ def run(args=None):
         "--action",
         type=str,
         help="Action to perform.",
-        choices=["create", "restore", "version", "delete", "init"],
+        choices=["create", "restore", "version", "delete", "init", "diff"],
     )
 
     checkpoint_arg_parser.add_argument(

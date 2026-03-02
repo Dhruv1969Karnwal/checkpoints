@@ -13,6 +13,10 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
+from rich.console import Console
+
+console = Console()
+
 if TYPE_CHECKING:
     from checkpoint.exclusion import ExclusionConfig
 
@@ -166,6 +170,8 @@ def compute_line_diff(old_lines: List[str], new_lines: List[str]) -> List[Dict[s
             'start_line': j1 + 1,  # Convert to 1-indexed
             'end_line': j2,  # Already correct for 1-indexed end
             'change_type': change_type,
+            'added_lines': new_lines[j1:j2],
+            'deleted_lines': old_lines[i1:i2],
         }
 
         # Include old range for modified and deleted lines
@@ -430,7 +436,9 @@ def _process_file(
                 file_info['line_changes'] = [{
                     'start_line': 1,
                     'end_line': len(lines),
-                    'change_type': 'added'
+                    'change_type': 'added',
+                    'added_lines': lines,
+                    'deleted_lines': []
                 }]
             else:
                 file_info['is_binary'] = True
@@ -455,7 +463,9 @@ def _process_file(
                 file_info['line_changes'] = [{
                     'start_line': 1,
                     'end_line': len(lines),
-                    'change_type': 'added'
+                    'change_type': 'added',
+                    'added_lines': lines,
+                    'deleted_lines': []
                 }]
             else:
                 file_info['is_binary'] = True
@@ -534,7 +544,9 @@ def _process_deleted_file(file_path: str, content: bytes) -> Dict[str, Any]:
                 'start_line': 1,
                 'end_line': len(lines),
                 'change_type': 'deleted',
-                'old_range': [1, len(lines)]
+                'old_range': [1, len(lines)],
+                'added_lines': [],
+                'deleted_lines': lines
             }]
         else:
             file_info['is_binary'] = True
@@ -985,3 +997,62 @@ def has_changes(
 
     logger.debug(f"[Phase 3] All hashes match - no changes detected")
     return False, latest_checkpoint
+
+
+def show_diff(trace_data: Dict[str, Any]):
+    """Print the trace data as a human-readable diff.
+
+    Parameters
+    ----------
+    trace_data : Dict[str, Any]
+        The trace data containing file changes.
+    """
+    summary = trace_data.get('summary', {})
+    console.print(f"\n[bold underline]Checkpoint Diff: {trace_data['checkpoint_name']}[/]")
+    if trace_data.get('previous_checkpoint'):
+        console.print(f"Comparing against: {trace_data['previous_checkpoint']}")
+    console.print(f"Created at: {trace_data['created_at']}")
+    console.print(f"\n[bold]Summary:[/]")
+    console.print(f"  Files changed: {summary.get('total_files_changed', 0)}")
+    console.print(f"  Lines added:   [green]+{summary.get('total_lines_added', 0)}[/]")
+    console.print(f"  Lines deleted: [red]-{summary.get('total_lines_deleted', 0)}[/]")
+    console.print(f"  Lines modified: [yellow]~{summary.get('total_lines_modified', 0)}[/]")
+
+    for file_path, info in trace_data.get('files', {}).items():
+        if info['status'] == 'unchanged':
+            continue
+
+        status_color = {
+            'added': 'green',
+            'deleted': 'red',
+            'modified': 'yellow'
+        }.get(info['status'], 'white')
+
+        console.print(f"\n[{status_color}][bold]{info['status'].upper()}[/]: {file_path}[/]")
+
+        if info.get('is_binary'):
+            console.print("  (Binary file - no line diff available)")
+            continue
+
+        for change in info.get('line_changes', []):
+            ctype = change['change_type']
+            if ctype == 'added':
+                console.print(f"  [green]+ Lines {change['start_line']}-{change['end_line']}[/]")
+                for line in change.get('added_lines', []):
+                    safe_line = line.rstrip().replace("[", "\\[")
+                    console.print(f"    [green]+ {safe_line}[/]")
+            elif ctype == 'deleted':
+                console.print(f"  [red]- Lines {change['old_range'][0]}-{change['old_range'][1]}[/]")
+                for line in change.get('deleted_lines', []):
+                    safe_line = line.rstrip().replace("[", "\\[")
+                    console.print(f"    [red]- {safe_line}[/]")
+            elif ctype == 'modified':
+                old_range = f"{change['old_range'][0]}-{change['old_range'][1]}"
+                new_range = f"{change['start_line']}-{change['end_line']}"
+                console.print(f"  [yellow]~ Lines {old_range} -> {new_range}[/]")
+                for line in change.get('deleted_lines', []):
+                    safe_line = line.rstrip().replace("[", "\\[")
+                    console.print(f"    [red]- {safe_line}[/]")
+                for line in change.get('added_lines', []):
+                    safe_line = line.rstrip().replace("[", "\\[")
+                    console.print(f"    [green]+ {safe_line}[/]")

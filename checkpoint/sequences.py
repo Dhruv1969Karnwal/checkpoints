@@ -20,7 +20,7 @@ from checkpoint.io import IO
 from checkpoint.readers import get_all_readers
 from checkpoint.trace import (
     TraceGenerator, compute_file_hash, get_file_metadata, has_changes,
-    is_legacy_checkpoint
+    is_legacy_checkpoint, show_diff
 )
 from checkpoint.utils import LogColors, get_reader_by_extension, Logger
 
@@ -964,6 +964,25 @@ class CheckpointSequence(Sequence):
         _msg = f'Running version {version}'
         self.log(_msg, timestamp=True, log_type="INFO")
 
+    def seq_diff_checkpoints(self):
+        """Show the diff of a checkpoint against its previous one."""
+        # Use dest_dir to find the checkpoint
+        checkpoint_dir = os.path.join(self.dest_dir, '.checkpoint', self.sequence_name)
+        if not os.path.isdir(checkpoint_dir):
+            raise ValueError(f'Checkpoint {self.sequence_name} does not exist')
+
+        trace_path = os.path.join(checkpoint_dir, 'trace.json')
+        
+        if not os.path.exists(trace_path):
+            self.log(f"No trace.json found for checkpoint {self.sequence_name}. Diff might be unavailable for the first checkpoint.",
+                     colors=LogColors.WARNING, timestamp=True, log_type="INFO")
+            return
+
+        with open(trace_path, 'r', encoding='utf-8') as f:
+            trace_data = json.load(f)
+        
+        show_diff(trace_data)
+
 
 class CLISequence(Sequence):
     """Sequence for the CLI environment."""
@@ -1027,6 +1046,8 @@ class CLISequence(Sequence):
             action = 'seq_init_checkpoint'
         elif args.action == 'version':
             action = 'seq_version'
+        elif args.action == 'diff':
+            action = 'seq_diff_checkpoints'
         else:
             raise ValueError('Invalid action.')
 
