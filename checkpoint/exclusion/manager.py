@@ -93,7 +93,8 @@ class ExclusionManager:
         if os.path.islink(path):
             try:
                 target = os.path.realpath(path)
-                if not target.startswith(self.root_path):
+                # Use commonpath to avoid prefix confusion (e.g., /repo vs /repo2)
+                if os.path.commonpath([self.root_path, target]) != self.root_path:
                     self._stats['tier1_exclusions'] += 1
                     return ExclusionResult(
                         excluded=True,
