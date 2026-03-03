@@ -391,6 +391,26 @@ def generate_trace(
                 trace['files'][file_path] = file_info
                 trace['summary']['total_files_changed'] += 1
                 trace['summary']['deleted_files'] += 1
+                # Accumulate deleted files' line stats into summary
+                if 'stats' in file_info:
+                    trace['summary']['total_lines_added'] += file_info['stats'].get('lines_added', 0)
+                    trace['summary']['total_lines_deleted'] += file_info['stats'].get('lines_deleted', 0)
+                    trace['summary']['total_lines_modified'] += file_info['stats'].get('lines_modified', 0)
+
+    # Build per-file overview for all changed files
+    files_overview = []
+    for file_path, file_info in trace['files'].items():
+        if file_info['status'] != 'unchanged':
+            stats = file_info.get('stats', {})
+            files_overview.append({
+                'file': os.path.basename(file_path),
+                'path': file_path,
+                'status': file_info['status'],
+                'lines_added': stats.get('lines_added', 0),
+                'lines_deleted': stats.get('lines_deleted', 0),
+                'lines_modified': stats.get('lines_modified', 0),
+            })
+    trace['summary']['files_overview'] = files_overview
 
     return trace
 
