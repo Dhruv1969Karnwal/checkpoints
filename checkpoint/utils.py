@@ -16,6 +16,7 @@ class LogColors:
     BLUE = '[blue]'
     CYAN = '[cyan]'
     SUCCESS = '[green]'
+    INFO = '[blue]'
     WARNING = '[yellow]'
     ERROR = '[red]'
     ENDC = '[/]'
@@ -82,11 +83,21 @@ class Logger:
             colors = [colors]
 
         if as_obj:
-            msg = {(_file, _timestamp): msg}
+            _file_val = _file if log_caller else "unknown"
+            _time_val = _timestamp if timestamp else "00:00:00"
+            msg = {(_file_val, _time_val): msg}
         else:
-            msg = f'[{_file}, {_timestamp}]: {msg} - {log_type}'
+            prefix = ""
+            if log_caller or timestamp:
+                parts = []
+                if log_caller: parts.append(_file)
+                if timestamp: parts.append(_timestamp)
+                prefix = f"[{', '.join(parts)}]: "
+            
+            msg = f"{prefix}{msg} - {log_type}"
 
         if self.log_mode == 't':
+            # Use rich_print (aliased as print in __main__.py or available via rich)
             print(f"{''.join(colors)}{msg}{self.log_colors.ENDC}")
         elif self.log_mode == 'f':
             if not as_obj:
@@ -140,7 +151,7 @@ def get_reader_by_extension(extension):
         reader_obj = reader()
         if extension in reader_obj.valid_extensions:
             return reader_obj
-    print(f'{LogColors.ERROR}No default reader found for {extension}{LogColors.ENDC}')
+    # print(f'{LogColors.ERROR}No default reader found for {extension}{LogColors.ENDC}')
 
 
 def execute_command(command):

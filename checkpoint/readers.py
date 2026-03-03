@@ -151,7 +151,7 @@ class TextReader(Reader):
             Dictionary containing the content of the file
         """
 
-        return {file_path: self._io.read(file_path, mode='r')}
+        return {file_path: self._io.read(file_path, mode='rb')}
 
     def _validate_extensions(self, extensions):
         """Validate if the extensions work with the current reader.
@@ -161,19 +161,8 @@ class TextReader(Reader):
         extensions: list
             List of extensions to be validated
         """
-        invalid_idxs = []
-
-        with InTemporaryDirectory() as tdir:
-            for ext in extensions:
-                temp_file = os.path.join(tdir, f'test.{ext}')
-                with open(temp_file, 'w+') as f:
-                    try:
-                        f.write('test')
-                        self._read(temp_file)
-                    except UnicodeDecodeError:
-                        invalid_idxs.append(extensions.index(ext))
-
-        return invalid_idxs
+        # Since we read in binary mode ('rb'), all files are readable.
+        return []
 
 
 class ImageReader(Reader):
@@ -261,12 +250,11 @@ class ByteReader(Reader):
         with InTemporaryDirectory() as tdir:
             for ext in extensions:
                 temp_file = os.path.join(tdir, f'test.{ext}')
-                with open(temp_file, 'wb') as f:
-                    f.write(b'test')
+                try:
+                    with open(temp_file, 'wb') as f:
+                        f.write(b'test')
                     self._read(temp_file)
-                invalid_idxs.append(extensions.index(ext))
-
-        for idx in invalid_idxs:
-            extensions.pop(idx)
+                except Exception:
+                    invalid_idxs.append(extensions.index(ext))
 
         return invalid_idxs

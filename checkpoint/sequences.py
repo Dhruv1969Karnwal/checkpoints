@@ -1,6 +1,9 @@
 import json
+import logging
 import os
+from argparse import Namespace
 from collections import OrderedDict
+from datetime import datetime, timezone
 from itertools import count
 from multiprocessing import cpu_count
 from tempfile import TemporaryDirectory as InTemporaryDirectory
@@ -11,19 +14,88 @@ from joblib import Parallel, delayed
 from rich.progress import Progress, SpinnerColumn
 
 from checkpoint import __version__ as version
+from checkpoint.constants import CHECKPOINT_FORMAT_VERSION
 from checkpoint.crypt import Crypt, generate_key
 from checkpoint.io import IO
 from checkpoint.readers import get_all_readers
+from checkpoint.trace import (
+    TraceGenerator, compute_file_hash, get_file_metadata, has_changes,
+    is_legacy_checkpoint, show_diff
+)
 from checkpoint.utils import LogColors, get_reader_by_extension, Logger
 
 _logger = Logger()
+logger = logging.getLogger(__name__)
+
+
+def migrate_config_if_needed(config_path):
+    """Migrate old config format to new format.
+
+    Parameters
+    ----------
+    config_path: str
+        Path to the .config file.
+
+    Returns
+    -------
+    dict
+        The migrated config dictionary.
+    """
+    if not os.path.exists(config_path):
+        return None
+
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+
+    # Check if migration needed
+    if 'root_dir' in config and 'source_dir' not in config:
+        config['source_dir'] = config['root_dir']
+        config['dest_dir'] = config['root_dir']
+        config['version'] = '2.0.0'
+
+        with open(config_path, 'w') as f:
+            json.dump(config, f, indent=4)
+
+        _logger.log(
+            "Migrated config to new format (v2.0.0)",
+            LogColors.INFO, timestamp=True, log_type="INFO"
+        )
+
+    return config
+
+
+def load_config_with_migration(config_path):
+    """Load config with backward compatibility.
+
+    Parameters
+    ----------
+    config_path: str
+        Path to the .config file.
+
+    Returns
+    -------
+    dict
+        The config dictionary with source_dir and dest_dir populated.
+    """
+    if not os.path.exists(config_path):
+        return None
+
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+
+    # Handle old format - provide defaults without modifying file
+    if 'root_dir' in config:
+        config.setdefault('source_dir', config['root_dir'])
+        config.setdefault('dest_dir', config['root_dir'])
+
+    return config
 
 
 class Sequence:
     """Class to represent a sequence of operations."""
 
     _progress = Progress(
-        SpinnerColumn(), *Progress.get_default_columns(), transient=False)
+        SpinnerColumn(spinner_name="line"), *Progress.get_default_columns(), transient=False)
 
     def __init__(self, sequence_name, order_dict=None, terminal_log=False, env='UI'):
         """Initialize the sequence class.
@@ -174,7 +246,9 @@ class Sequence:
                 "error": "One or more actions failed!"
             }
 
-            if self._progress.finished:
+            _tasks_finished = all(self._progress.tasks[tid].finished for tid in self._task_ids.values())
+
+            if _tasks_finished:
                 self.log(_finish_msgs["success"], [
                     LogColors.SUCCESS, LogColors.BOLD], timestamp=True, log_type="SUCCESS")
 
@@ -183,7 +257,12 @@ class Sequence:
                     LogColors.SUCCESS, LogColors.BOLD], timestamp=True, log_type="ERROR")
 
             self._stop_progress_bars()
-            self._progress.console.clear_live()
+            # Only clear_live if progress was started (not for nested sequences)
+            if self._progress_state == "started":
+                try:
+                    self._progress.console.clear_live()
+                except (IndexError, RuntimeError):
+                    pass  # Already cleared or not in live context
             self.on_sequence_end(self)
 
         elif execution_policy == 'increasing_order':
@@ -252,8 +331,7 @@ class Sequence:
 
     def log(self, *args, **kwargs):
         """Wrapper function for `logger.log`"""
-        if self.env == 'UI':
-            self.logger.log(*args, **kwargs)
+        self.logger.log(*args, **kwargs)
 
     @property
     def name(self):
@@ -279,12 +357,12 @@ class IOSequence(Sequence):
     """Class to represent a sequence of IO operations."""
 
     def __init__(self, sequence_name='IO_Sequence', order_dict=None,
-                 root_dir=None, ignore_dirs=None, num_cores=None,
-                 terminal_log=False, env='UI'):
+                 source_dir=None, dest_dir=None, root_dir=None, ignore_dirs=None,
+                 num_cores=None, terminal_log=False, env='UI', exclusion_config=None):
         """Initialize the IO sequence class.
 
         Default execution sequence is:
-        1. Walk through the root directory
+        1. Walk through the source directory
         2. Group files by extension
         3. Map readers based on extension
         4. Read files
@@ -296,14 +374,21 @@ class IOSequence(Sequence):
             Name of the sequence.
         order_dict: dict, optional
             Dictionary of function names and their order in the sequence.
+        source_dir: str, optional
+            The source directory to track/monitor.
+        dest_dir: str, optional
+            The destination directory for .checkpoint storage.
+            Defaults to source_dir if not provided.
         root_dir: str, optional
-            The root directory.
+            [DEPRECATED] Use source_dir instead. Kept for backward compatibility.
         ignore_dirs: list of str, optional
             List of directories to be ignored.
         num_cores: int, optional
             Number of cores to be used for parallel processing.
         terminal_log: bool, optional
             If True, messages will be logged to the terminal
+        exclusion_config: ExclusionConfig, optional
+            Configuration for the three-tier exclusion system.
         """
         self.default_order_dict = {
             'seq_walk_directories': 4,
@@ -317,10 +402,24 @@ class IOSequence(Sequence):
                                          order_dict or self.default_order_dict,
                                          terminal_log=terminal_log, env=env)
 
-        self.root_dir = root_dir or os.getcwd()
+        # Handle backward compatibility with root_dir parameter
+        if root_dir is not None and source_dir is None:
+            source_dir = root_dir
+
+        self.source_dir = source_dir or os.getcwd()
+        self.dest_dir = dest_dir or self.source_dir
+
+        # Keep root_dir as an alias for source_dir for backward compatibility
+        self.root_dir = self.source_dir
+
         self.ignore_dirs = ignore_dirs or []
-        self.ignore_dirs.append('.checkpoint')
-        self.io = IO(self.root_dir, ignore_dirs=self.ignore_dirs)
+        # Only add .checkpoint to ignore if source == destination
+        if self.source_dir == self.dest_dir:
+            self.ignore_dirs.append('.checkpoint')
+
+        self.exclusion_config = exclusion_config
+        self.io = IO(self.source_dir, ignore_dirs=self.ignore_dirs,
+                     exclusion_config=exclusion_config)
         self.num_cores = num_cores or cpu_count()
 
     def seq_walk_directories(self):
@@ -435,14 +534,24 @@ class IOSequence(Sequence):
         """
         readers_dict, extension_dict = readers_extension
 
+        # Count total files for logging
+        total_files = sum(len(files) for files in extension_dict.values())
+        logger.debug(f"[Read] Starting to read {total_files} files...")
+        
+        for ext, files in extension_dict.items():
+            for file in files:
+                logger.debug(f"[Read] Reading: {file}")
+
         contents = \
             Parallel(self.num_cores)(delayed(readers_dict[ext].read)(files,
                                      validate=False) for (ext, files) in
                                      extension_dict.items())
+        
+        logger.debug(f"[Read] Completed reading {total_files} files")
         return contents
 
     def seq_encrypt_files(self, contents):
-        """Encrypt the read files.
+        """Encrypt the read files and return new format with metadata.
 
         Parameters
         ----------
@@ -452,26 +561,69 @@ class IOSequence(Sequence):
         Returns
         -------
         dict
-            Dictionary of file paths and their encrypted content.
+            Dictionary with new checkpoint format containing:
+            - version: Checkpoint format version
+            - created_at: ISO timestamp
+            - files: Dict of file paths to their encrypted content and metadata
         """
         # TODO: Parallelize this
-        path2content = {}
+        files_data = {}
+        # Use dest_dir for .checkpoint path (where the key is stored)
         crypt_obj = Crypt(key='crypt.key', key_path=os.path.join(
-            self.root_dir, '.checkpoint'))
+            self.dest_dir, '.checkpoint'))
+
+        # Count total files for logging
+        total_files = sum(len(content) for content in contents)
+        logger.debug(f"[Encrypt] Starting encryption of {total_files} files...")
 
         for content in contents:
             for obj in content:
                 path = list(obj.keys())[0]
-                path2content[path] = crypt_obj.encrypt(path)
+                content_bytes = obj[path]
+                
+                logger.debug(f"[Encrypt] Processing: {path}")
+                
+                # Get file metadata
+                logger.debug(f"[Encrypt] Getting metadata for: {path}")
+                try:
+                    metadata = get_file_metadata(path)
+                except OSError:
+                    # File might not exist or be accessible, use defaults
+                    metadata = {'size': 0, 'mtime': 0}
+                logger.debug(f"[Encrypt] Size: {metadata['size']}, Mtime: {metadata['mtime']}")
+                
+                # Compute hash of original content (already bytes)
+                logger.debug(f"[Encrypt] Computing hash for: {path}")
+                content_hash = compute_file_hash(content_bytes)
+                logger.debug(f"[Encrypt] Hash: {content_hash}")
+                
+                # Encrypt the file content
+                logger.debug(f"[Encrypt] Encrypting: {path}")
+                encrypted_content = crypt_obj.encrypt(content_bytes)
+                
+                files_data[path] = {
+                    'content': encrypted_content,
+                    'hash': content_hash,
+                    'size': metadata['size'],
+                    'mtime': metadata['mtime']
+                }
 
-        return path2content
+        logger.debug(f"[Encrypt] Completed encryption of {total_files} files")
+
+        # Return new format with metadata
+        return {
+            'version': CHECKPOINT_FORMAT_VERSION,
+            'created_at': datetime.now(timezone.utc).isoformat(),
+            'files': files_data
+        }
 
 
 class CheckpointSequence(Sequence):
     """Sequence to perform checkpoint operations."""
 
-    def __init__(self, sequence_name, order_dict, root_dir, ignore_dirs,
-                 terminal_log=False, env='UI'):
+    def __init__(self, sequence_name, order_dict, source_dir, dest_dir, ignore_dirs,
+                 terminal_log=False, env='UI', checkpoint_type=None, subtype=None, 
+                 force=False, exclusion_config=None):
         """Initialize the CheckpointSequence class.
 
         Parameters
@@ -480,67 +632,128 @@ class CheckpointSequence(Sequence):
             Name of the sequence.
         order_dict: dict
             Dictionary of function names and their order in the sequence.
-        root_dir: str
-            The root directory.
+        source_dir: str
+            The source directory to track/monitor.
+        dest_dir: str
+            The destination directory for .checkpoint storage.
         ignore_dirs: list of str
             List of directories to be ignored.
         terminal_log: bool, optional
             If True, messages will be logged to the terminal
+        checkpoint_type: str, optional
+            Type of checkpoint ('human', 'ai', or 'codebase'). If provided, generates trace.json.
+        subtype: str, optional
+            Optional subtype for the checkpoint (saved to trace.json).
+        force: bool, optional
+            If True, create checkpoint even if no changes detected. Default is False.
+        exclusion_config: ExclusionConfig, optional
+            Configuration for the three-tier exclusion system.
         """
         self.sequence_name = sequence_name
         self.order_dict = order_dict
-        self.root_dir = root_dir
+        self.source_dir = source_dir
+        self.dest_dir = dest_dir
+        # Keep root_dir as an alias for source_dir for backward compatibility
+        self.root_dir = source_dir
         self.ignore_dirs = ignore_dirs
+        self.checkpoint_type = checkpoint_type
+        self.subtype = subtype
+        self.force = force
+        self.exclusion_config = exclusion_config
         super(CheckpointSequence, self).__init__(sequence_name, order_dict,
                                                  terminal_log=terminal_log, env=env)
 
     def _validate_checkpoint(self):
         """Validate if a checkpoint is valid."""
+        # Use dest_dir for checkpoint validation
         checkpoint_path = os.path.join(
-            self.root_dir, '.checkpoint', self.sequence_name)
+            self.dest_dir, '.checkpoint', self.sequence_name)
         if not os.path.isdir(checkpoint_path):
             raise ValueError(f'Checkpoint {self.sequence_name} does not exist')
 
     def seq_init_checkpoint(self):
         """Initialize the checkpoint directory."""
-        _io = IO(path=self.root_dir, mode="a",
+        # Create .checkpoint in destination directory
+        _io = IO(path=self.dest_dir, mode="a",
                  ignore_dirs=self.ignore_dirs)
-        path = _io.make_dir('.checkpoint')
-        generate_key('crypt.key', path)
+        
+        checkpoint_dir = os.path.join(self.dest_dir, '.checkpoint')
+        if not os.path.exists(checkpoint_dir):
+            path = _io.make_dir('.checkpoint')
+            generate_key('crypt.key', path)
+        else:
+            path = checkpoint_dir
 
         checkpoint_config = {
             'current_checkpoint': None,
             'checkpoints': [],
             'ignore_dirs': self.ignore_dirs,
-            'root_dir': self.root_dir,
+            'source_dir': self.source_dir,
+            'dest_dir': self.dest_dir,
+            'version': '2.0.0',
         }
 
-        config_path = os.path.join(self.root_dir, '.checkpoint', '.config')
+        config_path = os.path.join(self.dest_dir, '.checkpoint', '.config')
         _io.write(config_path, 'w+', json.dumps(checkpoint_config))
 
     def seq_create_checkpoint(self):
         """Create a new checkpoint for the target directory."""
+        # Ensure .checkpoint exists in destination
+        if not os.path.isdir(os.path.join(self.dest_dir, '.checkpoint')):
+            self.seq_init_checkpoint()
+
+        # Check if checkpoint exists in destination
         checkpoint_path = os.path.join(
-            self.root_dir, '.checkpoint', self.sequence_name)
+            self.dest_dir, '.checkpoint', self.sequence_name)
         if os.path.isdir(checkpoint_path):
             raise ValueError(f'Checkpoint {self.sequence_name} already exists')
 
-        _io = IO(path=self.root_dir, mode="a",
+        # Pre-creation change detection
+        # Build ignore_dirs for change detection - add .checkpoint if source == dest
+        _change_detection_ignore_dirs = list(self.ignore_dirs)
+        if self.source_dir == self.dest_dir:
+            _change_detection_ignore_dirs.append('.checkpoint')
+        
+        changes_detected, previous_checkpoint = has_changes(
+            source_dir=self.source_dir,
+            dest_dir=self.dest_dir,
+            ignore_dirs=_change_detection_ignore_dirs,
+            exclusion_config=self.exclusion_config
+        )
+
+        if not changes_detected:
+            if not self.force:
+                self.log("No changes detected since the last checkpoint. Use --force to create a checkpoint anyway.",
+                         colors=LogColors.WARNING, timestamp=True, log_type="INFO")
+                return
+            else:
+                self.log("No changes detected, but --force specified. Creating checkpoint anyway.",
+                         colors=LogColors.WARNING, timestamp=True, log_type="INFO")
+
+        self.log(f"Creating checkpoint: {self.sequence_name}",
+                 colors=LogColors.INFO, timestamp=True, log_type="INFO")
+
+        # IO for destination (write checkpoint data)
+        _io = IO(path=self.dest_dir, mode="a",
                  ignore_dirs=self.ignore_dirs)
 
-        _io_sequence = IOSequence(root_dir=self.root_dir,
+        # IOSequence reads from source, encrypts, and we store in destination
+        _io_sequence = IOSequence(source_dir=self.source_dir,
+                                  dest_dir=self.dest_dir,
                                   ignore_dirs=self.ignore_dirs,
-                                  terminal_log=self.terminal_log, env=self.env)
+                                  terminal_log=self.terminal_log, env=self.env,
+                                  exclusion_config=self.exclusion_config)
 
         enc_files = _io_sequence.execute_sequence(pass_args=True)[-1]
 
+        # Create checkpoint directory in destination
         checkpoint_path = os.path.join(
-            self.root_dir, '.checkpoint', self.sequence_name)
+            self.dest_dir, '.checkpoint', self.sequence_name)
         checkpoint_path = _io.make_dir(checkpoint_path)
         checkpoint_file_path = os.path.join(
             checkpoint_path, f'{self.sequence_name}.json')
 
-        config_path = os.path.join(self.root_dir, '.checkpoint', '.config')
+        config_path = os.path.join(self.dest_dir, '.checkpoint', '.config')
 
         with open(checkpoint_file_path, 'w+') as checkpoint_file:
             json.dump(enc_files, checkpoint_file, indent=4)
@@ -553,8 +766,11 @@ class CheckpointSequence(Sequence):
         with open(config_path, 'w+') as config_file:
             json.dump(checkpoint_config, config_file, indent=4)
 
+        # Walk source directory for metadata
         root2file = {}
-        for root, file in _io.walk_directory():
+        source_io = IO(path=self.source_dir, ignore_dirs=self.ignore_dirs,
+                      exclusion_config=self.exclusion_config)
+        for root, file in source_io.walk_directory():
             if root in root2file:
                 root2file[root].append(os.path.join(root, file))
             else:
@@ -563,15 +779,112 @@ class CheckpointSequence(Sequence):
         with open(os.path.join(checkpoint_path, '.metadata'), 'w+') as metadata_file:
             json.dump(root2file, metadata_file, indent=4)
 
+        # Generate trace.json if checkpoint_type is provided
+        if self.checkpoint_type:
+            self.log(f"Generating trace for checkpoint: {self.sequence_name}",
+                     colors=LogColors.INFO, timestamp=True, log_type="INFO")
+            self._generate_trace(enc_files, checkpoint_path)
+
+        self.log(f"Checkpoint {self.sequence_name} created successfully!",
+                 colors=LogColors.SUCCESS, timestamp=True, log_type="SUCCESS")
+
+    def _generate_trace(self, enc_files, checkpoint_path):
+        """Generate trace.json for the checkpoint.
+
+        Parameters
+        ----------
+        enc_files: dict
+            Dictionary of encrypted file paths and their content.
+            Can be in legacy format (path→encrypted_content) or
+            new format (with 'version', 'created_at', 'files' keys).
+        checkpoint_path: str
+            Path to the checkpoint directory.
+        """
+        # Read key from destination
+        _key = os.path.join(self.dest_dir, '.checkpoint')
+        crypt = Crypt(key='crypt.key', key_path=_key)
+
+        # Handle both legacy and new checkpoint formats
+        if is_legacy_checkpoint(enc_files):
+            # Legacy format: direct path→encrypted_content mapping
+            files_data = enc_files
+        else:
+            # New format: files are nested under 'files' key
+            files_data = enc_files.get('files', {})
+
+        current_files = {}
+        for file_path, file_info in files_data.items():
+            # In new format, file_info is a dict with 'content', 'hash', etc.
+            # In legacy format, file_info is just the encrypted content string
+            if isinstance(file_info, dict):
+                encrypted_content = file_info['content']
+            else:
+                encrypted_content = file_info
+            
+            content = crypt.decrypt(encrypted_content)
+            current_files[file_path] = content
+
+        # Get previous checkpoint files if available
+        previous_files = None
+        previous_checkpoint_name = None
+
+        # Read config from destination
+        config_path = os.path.join(self.dest_dir, '.checkpoint', '.config')
+        with open(config_path, 'r') as config_file:
+            config = json.load(config_file)
+
+        checkpoints = config.get('checkpoints', [])
+        # Get the checkpoint before the current one (current is already added)
+        if len(checkpoints) > 1:
+            previous_checkpoint_name = checkpoints[-2]
+            previous_checkpoint_path = os.path.join(
+                self.dest_dir, '.checkpoint', previous_checkpoint_name,
+                f'{previous_checkpoint_name}.json')
+
+            if os.path.exists(previous_checkpoint_path):
+                with open(previous_checkpoint_path, 'r') as prev_file:
+                    prev_enc_files = json.load(prev_file)
+
+                # Handle both legacy and new checkpoint formats for previous checkpoint
+                if is_legacy_checkpoint(prev_enc_files):
+                    prev_files_data = prev_enc_files
+                else:
+                    prev_files_data = prev_enc_files.get('files', {})
+
+                previous_files = {}
+                for file_path, file_info in prev_files_data.items():
+                    if isinstance(file_info, dict):
+                        encrypted_content = file_info['content']
+                    else:
+                        encrypted_content = file_info
+                    
+                    content = crypt.decrypt(encrypted_content)
+                    previous_files[file_path] = content
+
+        # Generate and save trace
+        trace_generator = TraceGenerator(
+            checkpoint_name=self.sequence_name,
+            checkpoint_type=self.checkpoint_type,
+            source_dir=self.source_dir,
+            dest_dir=self.dest_dir,
+            subtype=self.subtype
+        )
+        trace_generator.generate_and_save(
+            current_files=current_files,
+            previous_files=previous_files,
+            previous_checkpoint_name=previous_checkpoint_name
+        )
+
     def seq_delete_checkpoint(self):
         """Delete the checkpoint for the target directory."""
         self._validate_checkpoint()
-        _io = IO(path=self.root_dir, mode="a",
+        # Use dest_dir for checkpoint operations
+        _io = IO(path=self.dest_dir, mode="a",
                  ignore_dirs=self.ignore_dirs)
         checkpoint_path = os.path.join(
-            self.root_dir, '.checkpoint', self.sequence_name)
+            self.dest_dir, '.checkpoint', self.sequence_name)
 
-        config_path = os.path.join(self.root_dir, '.checkpoint', '.config')
+        config_path = os.path.join(self.dest_dir, '.checkpoint', '.config')
         with open(config_path, 'r') as config_file:
             checkpoint_config = json.load(config_file)
             checkpoint_config['checkpoints'].remove(self.sequence_name)
@@ -589,15 +902,22 @@ class CheckpointSequence(Sequence):
     def seq_restore_checkpoint(self):
         """Restore back to a specific checkpoint."""
         self._validate_checkpoint()
-        _io = IO(path=self.root_dir, mode="a",
+        self.log(f"Restoring checkpoint: {self.sequence_name}",
+                 colors=LogColors.INFO, timestamp=True, log_type="INFO")
+        logger.debug(f"[Restore] Starting checkpoint restoration...")
+        
+        # IO for writing to source directory
+        _io = IO(path=self.source_dir, mode="a",
                  ignore_dirs=self.ignore_dirs)
-        _key = os.path.join(self.root_dir, '.checkpoint')
+        # Read encryption key from destination
+        _key = os.path.join(self.dest_dir, '.checkpoint')
         crypt = Crypt(key='crypt.key', key_path=_key)
 
-        checkpoint_path = os.path.join(self.root_dir, '.checkpoint',
+        # Read checkpoint data from destination
+        checkpoint_path = os.path.join(self.dest_dir, '.checkpoint',
                                        self.sequence_name, f'{self.sequence_name}.json')
 
-        config_path = os.path.join(self.root_dir, '.checkpoint', '.config')
+        config_path = os.path.join(self.dest_dir, '.checkpoint', '.config')
 
         with open(checkpoint_path, 'r') as checkpoint_file:
             checkpoint_dict = json.load(checkpoint_file)
@@ -609,14 +929,81 @@ class CheckpointSequence(Sequence):
         with open(config_path, 'w+') as config_file:
             json.dump(checkpoint_config, config_file, indent=4)
 
-        for file, content in checkpoint_dict.items():
-            content = crypt.decrypt(content)
+        # Handle both legacy and new checkpoint formats
+        if is_legacy_checkpoint(checkpoint_dict):
+            # Legacy format: direct path→encrypted_content mapping
+            files_data = checkpoint_dict
+            logger.debug(f"[Restore] Checkpoint format: legacy")
+        else:
+            # New format: files are nested under 'files' key
+            files_data = checkpoint_dict.get('files', {})
+            logger.debug(f"[Restore] Checkpoint format: new (v{checkpoint_dict.get('version', 'unknown')})")
+
+        logger.debug(f"[Restore] Files to restore: {len(files_data)}")
+
+        # Clean restore: delete files that are not in the checkpoint
+        self.log(f"Cleaning source directory...", colors=LogColors.INFO, timestamp=True, log_type="INFO")
+        
+        # Refresh the IO file list to include newly created untracked files
+        _io.update_paths(self.source_dir)
+        
+        # Get all local files currently in the source directory
+        current_local_files = set(_io.files)
+        checkpoint_files = set(files_data.keys())
+        
+        # Files to delete are those present locally but not in the checkpoint
+        files_to_delete = current_local_files - checkpoint_files
+        
+        for file_to_delete in files_to_delete:
+            self.log(f"Deleting untracked file: {file_to_delete}", 
+                     colors=LogColors.WARNING, timestamp=True, log_type="INFO")
+            if os.path.exists(file_to_delete):
+                try:
+                    os.remove(file_to_delete)
+                except Exception as e:
+                    logger.debug(f"[Restore] Failed to delete {file_to_delete}: {e}")
+
+        # Restore files to source_dir
+        for file, file_info in files_data.items():
+            # In new format, file_info is a dict with 'content', 'hash', etc.
+            # In legacy format, file_info is just the encrypted content string
+            if isinstance(file_info, dict):
+                encrypted_content = file_info['content']
+            else:
+                encrypted_content = file_info
+            
+            logger.debug(f"[Restore] Decrypting: {file}")
+            content = crypt.decrypt(encrypted_content)
+            logger.debug(f"[Restore] Writing: {file}")
             _io.write(file, 'wb+', content)
+
+        logger.debug(f"[Restore] Completed restoration of {len(files_data)} files")
+        self.log(f"Successfully restored to checkpoint {self.sequence_name}!",
+                 colors=LogColors.SUCCESS, timestamp=True, log_type="SUCCESS")
 
     def seq_version(self):
         """Print the version of the sequence."""
         _msg = f'Running version {version}'
         self.log(_msg, timestamp=True, log_type="INFO")
+
+    def seq_diff_checkpoints(self):
+        """Show the diff of a checkpoint against its previous one."""
+        # Use dest_dir to find the checkpoint
+        checkpoint_dir = os.path.join(self.dest_dir, '.checkpoint', self.sequence_name)
+        if not os.path.isdir(checkpoint_dir):
+            raise ValueError(f'Checkpoint {self.sequence_name} does not exist')
+
+        trace_path = os.path.join(checkpoint_dir, 'trace.json')
+        
+        if not os.path.exists(trace_path):
+            self.log(f"No trace.json found for checkpoint {self.sequence_name}. Diff might be unavailable for the first checkpoint.",
+                     colors=LogColors.WARNING, timestamp=True, log_type="INFO")
+            return
+
+        with open(trace_path, 'r', encoding='utf-8') as f:
+            trace_data = json.load(f)
+        
+        show_diff(trace_data)
 
 
 class CLISequence(Sequence):
@@ -656,6 +1043,9 @@ class CLISequence(Sequence):
         """Parse the arguments from the CLI."""
         if self.args is None:
             args = self.arg_parser.parse_args()
+        elif isinstance(self.args, Namespace):
+            # Already parsed (passed from __main__.py)
+            args = self.args
         else:
             args = self.arg_parser.parse_args(self.args)
         return args
@@ -678,6 +1068,8 @@ class CLISequence(Sequence):
             action = 'seq_init_checkpoint'
         elif args.action == 'version':
             action = 'seq_version'
+        elif args.action == 'diff':
+            action = 'seq_diff_checkpoints'
         else:
             raise ValueError('Invalid action.')
 
@@ -693,16 +1085,34 @@ class CLISequence(Sequence):
         """
         action, args = action_args
         _name = args.name
-        _path = args.path
         _ignore_dirs = args.ignore_dirs or []
+        _checkpoint_type = getattr(args, 'type', None)
+        _subtype = getattr(args, 'subtype', None)
+        _force = getattr(args, 'force', False)
+        _exclusion_config = getattr(args, 'exclusion_config', None)
         _helper_actions = ['seq_init_checkpoint', 'seq_version']
 
-        if not (_name and _path) and action not in _helper_actions:
-            raise ValueError(f'{args.action} requires a valid name and a path')
+        # Resolve source_dir and dest_dir from args
+        # Priority: source/destination > path (deprecated) > cwd
+        if hasattr(args, 'source') and args.source:
+            _source = os.path.abspath(args.source)
+            _dest = os.path.abspath(args.destination) if hasattr(args, 'destination') and args.destination else _source
+        elif hasattr(args, 'path') and args.path:
+            # Backward compatibility with deprecated --path argument
+            _source = os.path.abspath(args.path)
+            _dest = _source
+        else:
+            _source = os.getcwd()
+            _dest = _source
+
+        if not (_name and _source) and action not in _helper_actions:
+            raise ValueError(f'{args.action} requires a valid name and a source path')
 
         order_dict = {action: 0}
         _checkpoint_sequence = CheckpointSequence(
-            _name, order_dict, _path, _ignore_dirs,
-            terminal_log=self.terminal_log, env=self.env)
+            _name, order_dict, _source, _dest, _ignore_dirs,
+            terminal_log=self.terminal_log, env=self.env,
+            checkpoint_type=_checkpoint_type, subtype=_subtype, force=_force,
+            exclusion_config=_exclusion_config)
         action_function = getattr(_checkpoint_sequence, action)
         action_function()
